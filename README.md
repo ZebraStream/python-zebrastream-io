@@ -22,31 +22,29 @@ The synchronous interface provides a familiar, file-like API for reading from an
 #### Producer
 
 ```python
-from zebrastream.io.file import Writer
+import zebrastream.io.file as zsfile
 
-with Writer(connect_url, access_token=token) as writer:
-    writer.write(b"Hello ZebraStream!")
+with zsfile.open(mode="wb", connect_url, access_token=token) as f:
+    f.write(b"Hello ZebraStream!")
 ```
 
 #### Consumer
 
 ```python
-from zebrastream.io.file import Reader
+import zebrastream.io.file as zsfile
 
-with Reader(connect_url, access_token=token) as reader:
-    data = reader.read(1024) # read 1024 bytes
+with zsfile.open(mode="rb", connect_url, access_token=token) as f:
+    data = f.read(1024)  # read 1024 bytes
     # do something with the data
 ```
 
 ### Async interface (internal)
 
-"""
 Async interface for performing network operations using the asyncio event loop.
 
 This interface is currently non-public and subject to change, as it is under active development. The primary goal is to provide an internal, robust reference implementation for ZebraStream, leveraging Python's async/await syntax. At present, the implementation exclusively supports execution within the asyncio event loop, as it relies on the `httpio` library — the only request library currently offering reliable, full-duplex communication required for complete ZebraStream protocol support.
 
 Future plans include stabilizing the API and exposing standard async streaming interfaces such as asyncio `StreamReader`/`StreamWriter`.
-"""
 
 #### Producer
 
