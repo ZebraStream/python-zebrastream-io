@@ -1,0 +1,47 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# Installer logs
+dev-requirements.txt
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+*.iml
+
+# MacOS
+.DS_Store
+
+# Other editors
+*~
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/

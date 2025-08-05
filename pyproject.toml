@@ -1,0 +1,36 @@
+[tool.poetry]
+name = "zebrastream-io"
+version = "0.1.0"
+description = "A Pythonic client library for streaming data with ZebraStream."
+authors = ["Johannes Dröge <p5p129dw@parsimonit.com>"]
+readme = "README.md"
+packages = [
+    { include = "zebrastream", from = "src" },  # needed if namespaced package differs from package name
+]
+include = [
+    "src/zebrastream/io/py.typed"
+]
+
+[tool.poetry.dependencies]
+python = ">=3.10"
+typer = "^0.16.0"
+aiohttp = "^3.12.14"
+anyio = "^4.9.0"
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.12.7"
+mypy = "^1.17.1"
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
