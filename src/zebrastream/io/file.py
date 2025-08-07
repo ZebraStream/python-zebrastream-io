@@ -1,4 +1,12 @@
 # SPDX-License-Identifier: MIT
+"""
+Synchronous file-like wrappers for ZebraStream I/O.
+This module provides synchronous `Reader` and `Writer` classes that wrap the asynchronous
+ZebraStream protocol implementations, allowing seamless integration with code expecting
+standard file-like interfaces. The wrappers use AnyIO's blocking portal to bridge between
+sync and async code, supporting context management and typical file operations.
+"""
+
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar, overload
@@ -15,13 +23,13 @@ T = TypeVar('T')
 
 def open(mode: str, **kwargs: Any) -> "Reader | Writer":
     """
-    Open a ZebraStream URL for reading or writing.
+    Open a ZebraStream stream path for reading or writing.
 
     Args:
         mode (str): Mode to open the stream. 'rb' for reading, 'wb' for writing.
         **kwargs: Additional arguments passed to the corresponding Reader or Writer class.
         These may include:
-        connect_url (str): The URL to connect to the ZebraStream service.
+        stream_path (str): The ZebraStream stream path (e.g., '/my-stream').
         access_token (str, optional): Access token for authentication.
         content_type (str, optional): Content type for the stream.
         connect_timeout (int, optional): Timeout in seconds for the connect operation.
@@ -54,7 +62,7 @@ class Writer:
         Initialize a synchronous Writer for ZebraStream.
 
         Args:
-            **kwargs: Arguments passed to the underlying AsyncWriter (e.g., connect_url, access_token, content_type, connect_timeout).
+            **kwargs: Arguments passed to the underlying AsyncWriter (e.g., stream_path, access_token, content_type, connect_timeout).
         """
         logger.debug("Initializing sync Writer")
         self._async_writer_factory = lambda: AsyncWriter(**kwargs)
@@ -177,7 +185,7 @@ class Reader:
         Initialize a synchronous Reader for ZebraStream.
 
         Args:
-            **kwargs: Arguments passed to the underlying AsyncReader (e.g., connect_url, access_token, content_type, connect_timeout).
+            **kwargs: Arguments passed to the underlying AsyncReader (e.g., stream_path, access_token, content_type, connect_timeout).
         """
         logger.debug("Initializing sync Reader")
         self._async_reader_factory = lambda: AsyncReader(**kwargs)

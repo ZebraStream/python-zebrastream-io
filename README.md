@@ -2,6 +2,9 @@
 
 Python IO interface for ZebraStream data streaming services.
 
+> **Disclaimer:**  
+> The code in this package is considered **pre-production quality**. APIs and functionality may change without notice. Use with caution in production environments.
+
 ## Features
 - File-like synchronous interface for ZebraStream data streams
 - Async interface (internal, subject to change)
@@ -24,7 +27,7 @@ The synchronous interface provides a familiar, file-like API for reading from an
 ```python
 import zebrastream.io.file as zsfile
 
-with zsfile.open(mode="wb", connect_url, access_token=token, connect_timeout=None) as f:
+with zsfile.open(mode="wb", stream_path="/my-stream", access_token=token) as f:
     f.write(b"Hello ZebraStream!")
 ```
 
@@ -33,7 +36,7 @@ with zsfile.open(mode="wb", connect_url, access_token=token, connect_timeout=Non
 ```python
 import zebrastream.io.file as zsfile
 
-with zsfile.open(mode="rb", connect_url, access_token=token, connect_timeout=None) as f:
+with zsfile.open(mode="rb", stream_path="/my-stream", access_token=token) as f:
     data = f.read(1024)  # read 1024 bytes
     # do something with the data
 ```
@@ -53,7 +56,7 @@ from zebrastream.io._core import AsyncWriter
 import asyncio
 
 async def main():
-    async with AsyncWriter(connect_url, access_token=token, connect_timeout=None) as writer:
+    async with AsyncWriter(stream_path="/my-stream", access_token=token) as writer:
         await writer.write(b"Hello ZebraStream!")
 
 asyncio.run(main())
@@ -66,7 +69,7 @@ from zebrastream.io._core import AsyncReader
 import asyncio
 
 async def main():
-    async with AsyncReader(connect_url, access_token=token, connect_timeout=None) as reader:
+    async with AsyncReader(stream_path="/my-stream", access_token=token) as reader:
         data = await reader.read(1024)
         # do something with the data
 

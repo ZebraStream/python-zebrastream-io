@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "zebrastream-io"
-version = "0.1.0"
+version = "0.1.1"
 description = "A Pythonic client library for streaming data with ZebraStream."
 authors = ["Johannes Dröge <p5p129dw@parsimonit.com>"]
 readme = "README.md"

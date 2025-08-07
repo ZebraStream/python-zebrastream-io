@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: MIT
+"""
+Asynchronous ZebraStream I/O core implementation using aiohttp.
+This module provides core asynchronous classes and functions for interacting with ZebraStream data streams
+over HTTP using the ZebraStream Connect API.
+"""
 
 # TODO: an asyncio.StreamWriter-compatible wrapper class for AsyncZebraStreamWriter
 # TODO: an anyio.ByteStream-compatible wrapper class for AsyncZebraStreamWriter
 # TODO: check what happens, if the HTTP requests fail
 # TODO: control queue capacity/size --> keep external for now (like StreamWriter)
-# TODO: better exceptions
+# TODO: better (library-independent) exceptions
 # TODO: use Connect API server side timeout parameter for refreshing and better server-side resource handling
 # TODO: use exponential backoff for connect procedure
+# TODO: add aiohttp TCP connect timeout?
+# TODO: signal premature disconnect as exception to user code
 
 import asyncio
 import logging
@@ -16,13 +23,14 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# TODO: add aiohttp TCP connect timeout?
-async def _connect(connect_url: str, mode: str, access_token: str | None = None, connect_timeout: int | None = None) -> str:
+ZEBRASTREAM_CONNECT_API_URL = "https://connect.zebrastream.io/v0/"
+
+async def _connect(stream_path: str, mode: str, access_token: str | None = None, connect_timeout: int | None = None) -> str:
     """
     Establish a connection to the ZebraStream Connect API and get the data stream URL.
     
     Args:
-        connect_url (str): The ZebraStream Connect API URL.
+        stream_path (str): The ZebraStream stream path (e.g., '/my-stream').
         access_token (str, optional): Access token for authorization.
         connect_timeout (int, optional): Timeout in seconds for the connect operation.
     
@@ -33,6 +41,10 @@ async def _connect(connect_url: str, mode: str, access_token: str | None = None,
         asyncio.TimeoutError: If the overall operation exceeds the client timeout.
     """
     assert mode in {"await-reader", "await-writer"}, "Invalid mode specified. Use 'await-reader' or 'await-writer'."
+    
+    # Construct the full connect URL from the base URL and stream path
+    connect_url = ZEBRASTREAM_CONNECT_API_URL.rstrip('/') + stream_path
+    
     headers = {}
     if access_token:
         headers["Authorization"] = f"Bearer {access_token}"
@@ -44,7 +56,7 @@ async def _connect(connect_url: str, mode: str, access_token: str | None = None,
     if connect_timeout is not None:
         client_timeout = aiohttp.ClientTimeout(total=connect_timeout)
 
-    async def _connect_attempt_loop():
+    async def _connect_attempt_loop() -> str:
         async with aiohttp.ClientSession(timeout=client_timeout) as session:
             while True:
                 try:
@@ -78,7 +90,7 @@ class AsyncWriter:
     """
 
     _CONNECT_MODE: str = "await-reader"
-    _connect_url: str
+    _stream_path: str
     _access_token: str | None
     _content_type: str | None
     _connect_timeout: int | None
@@ -88,17 +100,17 @@ class AsyncWriter:
     _data_stream_url: str
     is_started: bool
 
-    def __init__(self, connect_url: str, access_token: str | None = None, content_type: str | None = None, connect_timeout: int | None = None) -> None:
+    def __init__(self, stream_path: str, access_token: str | None = None, content_type: str | None = None, connect_timeout: int | None = None) -> None:
         """
         Initialize an asynchronous ZebraStream writer.
 
         Args:
-            connect_url (str): The ZebraStream Connect API URL.
+            stream_path (str): The ZebraStream stream path (e.g., '/my-stream').
             access_token (str, optional): Access token for authorization.
             content_type (str, optional): Content-Type for the HTTP request.
             connect_timeout (int, optional): Server-side timeout in seconds for the connect operation.
         """
-        self._connect_url = connect_url
+        self._stream_path = stream_path
         self._access_token = access_token
         self._content_type = content_type
         self._connect_timeout = connect_timeout
@@ -108,7 +120,7 @@ class AsyncWriter:
 
     async def _start_connect(self) -> None:
         self._data_stream_url = await _connect(
-            connect_url=self._connect_url,
+            stream_path=self._stream_path,
             mode=self._CONNECT_MODE,
             access_token=self._access_token, 
             connect_timeout=self._connect_timeout
@@ -236,7 +248,7 @@ class AsyncReader:
     """
     _CONNECT_MODE: str = "await-writer"
     
-    _connect_url: str
+    _stream_path: str
     _access_token: str | None
     _content_type: str | None
     _connect_timeout: int | None
@@ -248,17 +260,17 @@ class AsyncReader:
     _eof: bool
     _exception: Exception | None
 
-    def __init__(self, connect_url: str, access_token: str | None = None, content_type: str | None = None, connect_timeout: int | None = None) -> None:
+    def __init__(self, stream_path: str, access_token: str | None = None, content_type: str | None = None, connect_timeout: int | None = None) -> None:
         """
         Initialize an asynchronous ZebraStream reader.
 
         Args:
-            connect_url (str): The ZebraStream Connect API URL.
+            stream_path (str): The ZebraStream stream path (e.g., '/my-stream').
             access_token (str, optional): Access token for authorization.
             content_type (str, optional): Content-Type for the HTTP request.
             connect_timeout (int, optional): Timeout in seconds for the connect operation.
         """
-        self._connect_url = connect_url
+        self._stream_path = stream_path
         self._access_token = access_token
         self._content_type = content_type
         self._connect_timeout = connect_timeout
@@ -270,7 +282,7 @@ class AsyncReader:
 
     async def _start_connect(self) -> None:
         self._data_stream_url = await _connect(
-            connect_url=self._connect_url,
+            stream_path=self._stream_path,
             mode=self._CONNECT_MODE,
             access_token=self._access_token, 
             connect_timeout=self._connect_timeout

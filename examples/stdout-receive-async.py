@@ -8,23 +8,22 @@ import typer
 
 from zebrastream.io._core import AsyncReader
 
-
 app = typer.Typer()
 
 @app.command()
 def main(
-    connect_url: str = typer.Argument(..., help="ZebraStream Connect API URL"),
+    stream_path: str = typer.Argument(..., help="ZebraStream stream path (e.g., '/my-stream')"),
     access_token: str = typer.Option(..., help="Access token for Authorization header"),
     block_size: int = typer.Option(4096, help="Size of data blocks to read from stdin (default: 4096 bytes)"),
     timeout: int = typer.Option(None, help="Connect timeout in seconds (default: None)"),
 ):
     """Read data from stdin and stream it to ZebraStream using AsyncZebraStreamWriter."""
-    asyncio.run(async_main(connect_url, access_token, block_size, timeout))
+    asyncio.run(async_main(stream_path, access_token, block_size, timeout))
 
-async def async_main(connect_url, access_token, block_size, timeout):
+async def async_main(stream_path, access_token, block_size, timeout):
     try:
         async with (
-            AsyncReader(connect_url=connect_url, access_token=access_token, connect_timeout=timeout) as reader,
+            AsyncReader(stream_path=stream_path, access_token=access_token, connect_timeout=timeout) as reader,
             anyio.wrap_file(sys.stdout.buffer) as f
         ):
             while data := await reader.read_exactly(block_size):
