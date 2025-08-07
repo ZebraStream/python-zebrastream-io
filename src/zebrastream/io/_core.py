@@ -1,19 +1,74 @@
 # SPDX-License-Identifier: MIT
+
+# TODO: an asyncio.StreamWriter-compatible wrapper class for AsyncZebraStreamWriter
+# TODO: an anyio.ByteStream-compatible wrapper class for AsyncZebraStreamWriter
+# TODO: check what happens, if the HTTP requests fail
+# TODO: control queue capacity/size --> keep external for now (like StreamWriter)
+# TODO: better exceptions
+# TODO: use Connect API server side timeout parameter for refreshing and better server-side resource handling
+# TODO: use exponential backoff for connect procedure
+
 import asyncio
 import logging
 import typing
 
 import aiohttp
 
-# TODO: an asyncio.StreamWriter-compatible wrapper class for AsyncZebraStreamWriter
-# TODO: an anyio.ByteStream-compatible wrapper class for AsyncZebraStreamWriter
-
 logger = logging.getLogger(__name__)
 
+# TODO: add aiohttp TCP connect timeout?
+async def _connect(connect_url: str, mode: str, access_token: str | None = None, connect_timeout: int | None = None) -> str:
+    """
+    Establish a connection to the ZebraStream Connect API and get the data stream URL.
+    
+    Args:
+        connect_url (str): The ZebraStream Connect API URL.
+        access_token (str, optional): Access token for authorization.
+        connect_timeout (int, optional): Timeout in seconds for the connect operation.
+    
+    Returns:
+        str: The data stream URL for subsequent requests.
+    
+    Raises:
+        asyncio.TimeoutError: If the overall operation exceeds the client timeout.
+    """
+    assert mode in {"await-reader", "await-writer"}, "Invalid mode specified. Use 'await-reader' or 'await-writer'."
+    headers = {}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    params = {"mode": mode}
+    if connect_timeout is not None:
+        params["timeout"] = str(connect_timeout+1)  # we prefer the client-side timeout to fire instead of the server-side timeout
 
-# TODO: check what happens, if the HTTP request fails
-# TODO: control queue capacity/size --> keep external for now (like StreamWriter)
-# TODO: better exceptions
+    client_timeout = None
+    if connect_timeout is not None:
+        client_timeout = aiohttp.ClientTimeout(total=connect_timeout)
+
+    async def _connect_attempt_loop():
+        async with aiohttp.ClientSession(timeout=client_timeout) as session:
+            while True:
+                try:
+                    async with session.get(connect_url, params=params, headers=headers) as resp:
+                        resp.raise_for_status()
+                        data_stream_url = (await resp.text()).strip()
+                        return data_stream_url
+                except asyncio.TimeoutError:
+                    # Don't catch TimeoutError here - let it bubble up to the outer try/except
+                    raise
+                except Exception as e:
+                    # Only retry on non-timeout exceptions (network errors, HTTP errors, etc.)
+                    logger.warning("Connection attempt failed: %s", e)
+                    await asyncio.sleep(1)
+    
+    try:
+        if connect_timeout is None:
+            return await _connect_attempt_loop()
+        return await asyncio.wait_for(_connect_attempt_loop(), timeout=connect_timeout)
+    except asyncio.TimeoutError:
+        logger.error("Connection attempt timed out after %s seconds", connect_timeout)
+        raise
+
+
 class AsyncWriter:
     """
     An asynchronous writer for ZebraStream data streams using HTTP PUT and aiohttp.
@@ -22,16 +77,18 @@ class AsyncWriter:
     buffering, and upload tasks, and supports use as an async context manager.
     """
 
+    _CONNECT_MODE: str = "await-reader"
     _connect_url: str
     _access_token: str | None
     _content_type: str | None
+    _connect_timeout: int | None
     _buffer: asyncio.Queue[bytes | None]
     _write_failed: bool
     _upload_task: asyncio.Task[None]
     _data_stream_url: str
     is_started: bool
 
-    def __init__(self, connect_url: str, access_token: str | None = None, content_type: str | None = None) -> None:
+    def __init__(self, connect_url: str, access_token: str | None = None, content_type: str | None = None, connect_timeout: int | None = None) -> None:
         """
         Initialize an asynchronous ZebraStream writer.
 
@@ -39,31 +96,24 @@ class AsyncWriter:
             connect_url (str): The ZebraStream Connect API URL.
             access_token (str, optional): Access token for authorization.
             content_type (str, optional): Content-Type for the HTTP request.
+            connect_timeout (int, optional): Server-side timeout in seconds for the connect operation.
         """
         self._connect_url = connect_url
         self._access_token = access_token
         self._content_type = content_type
+        self._connect_timeout = connect_timeout
         self._buffer = asyncio.Queue()
         self._write_failed = False
         self.is_started = False
 
     async def _start_connect(self) -> None:
-        """Wait for a receiver on the ZebraStream Connect API and retreive the ZebraStream Data API URL."""
-        headers = {}
-        if self._access_token:
-            headers["Authorization"] = f"Bearer {self._access_token}"
-        async with aiohttp.ClientSession() as session:
-            while True:
-                try:
-                    async with session.get(self._connect_url, params={"mode": "await-reader"}, headers=headers) as resp:
-                        resp.raise_for_status()
-                        self._data_stream_url = (await resp.text()).strip()
-                        assert self._data_stream_url, "Connect API returned empty ZebraStream Data API URL"
-                        return
-                except Exception as e:
-                    logger.warning("Connection attempt failed: %s", e)
-                    await asyncio.sleep(1)  # TODO: Avoid busy waiting
-
+        self._data_stream_url = await _connect(
+            connect_url=self._connect_url,
+            mode=self._CONNECT_MODE,
+            access_token=self._access_token, 
+            connect_timeout=self._connect_timeout
+        )
+    
     def _start_send(self) -> None:
         """Start the upload task to send data to the ZebraStream Data API."""
         assert hasattr(self, "_data_stream_url"), "Client is not connected"  # TODO: remove (expect correct handling)
@@ -184,9 +234,12 @@ class AsyncReader:
     This class provides an async interface for receiving data from a ZebraStream endpoint. It manages connection setup,
     buffering, and download tasks, and supports use as an async context manager.
     """
+    _CONNECT_MODE: str = "await-writer"
+    
     _connect_url: str
     _access_token: str | None
     _content_type: str | None
+    _connect_timeout: int | None
     _buffer: bytearray
     _read_event: asyncio.Event
     _download_task: asyncio.Task[None]
@@ -195,7 +248,7 @@ class AsyncReader:
     _eof: bool
     _exception: Exception | None
 
-    def __init__(self, connect_url: str, access_token: str | None = None, content_type: str | None = None) -> None:
+    def __init__(self, connect_url: str, access_token: str | None = None, content_type: str | None = None, connect_timeout: int | None = None) -> None:
         """
         Initialize an asynchronous ZebraStream reader.
 
@@ -203,10 +256,12 @@ class AsyncReader:
             connect_url (str): The ZebraStream Connect API URL.
             access_token (str, optional): Access token for authorization.
             content_type (str, optional): Content-Type for the HTTP request.
+            connect_timeout (int, optional): Timeout in seconds for the connect operation.
         """
         self._connect_url = connect_url
         self._access_token = access_token
         self._content_type = content_type
+        self._connect_timeout = connect_timeout
         self._buffer = bytearray()
         self._read_event = asyncio.Event()
         self.is_started = False
@@ -214,20 +269,13 @@ class AsyncReader:
         self._exception = None
 
     async def _start_connect(self) -> None:
-        headers = {}
-        if self._access_token:
-            headers["Authorization"] = f"Bearer {self._access_token}"
-        async with aiohttp.ClientSession() as session:
-            while True:
-                try:
-                    async with session.get(self._connect_url, params={"mode": "await-writer"}, headers=headers) as resp:
-                        resp.raise_for_status()
-                        self._data_stream_url = (await resp.text()).strip()
-                        return
-                except Exception as e:
-                    logger.warning("Connection attempt failed: %s", e)
-                    await asyncio.sleep(1)
-
+        self._data_stream_url = await _connect(
+            connect_url=self._connect_url,
+            mode=self._CONNECT_MODE,
+            access_token=self._access_token, 
+            connect_timeout=self._connect_timeout
+        )
+    
     def _start_download(self) -> None:
         assert hasattr(self, "_data_stream_url"), "Client is not connected"  # TODO: remove (expect correct handling)
         assert not hasattr(self, "_download_task"), "Download task is already running"  # TODO: remove (expect correct handling)

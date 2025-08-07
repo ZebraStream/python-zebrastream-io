@@ -24,6 +24,7 @@ def open(mode: str, **kwargs: Any) -> "Reader | Writer":
         connect_url (str): The URL to connect to the ZebraStream service.
         access_token (str, optional): Access token for authentication.
         content_type (str, optional): Content type for the stream.
+        connect_timeout (int, optional): Timeout in seconds for the connect operation.
 
     Returns:
         Reader or Writer: An instance of Reader (for 'rb') or Writer (for 'wb').
@@ -53,7 +54,7 @@ class Writer:
         Initialize a synchronous Writer for ZebraStream.
 
         Args:
-            **kwargs: Arguments passed to the underlying AsyncWriter (e.g., connect_url, access_token, content_type).
+            **kwargs: Arguments passed to the underlying AsyncWriter (e.g., connect_url, access_token, content_type, connect_timeout).
         """
         logger.debug("Initializing sync Writer")
         self._async_writer_factory = lambda: AsyncWriter(**kwargs)
@@ -176,7 +177,7 @@ class Reader:
         Initialize a synchronous Reader for ZebraStream.
 
         Args:
-            **kwargs: Arguments passed to the underlying AsyncReader (e.g., connect_url, access_token, content_type).
+            **kwargs: Arguments passed to the underlying AsyncReader (e.g., connect_url, access_token, content_type, connect_timeout).
         """
         logger.debug("Initializing sync Reader")
         self._async_reader_factory = lambda: AsyncReader(**kwargs)
