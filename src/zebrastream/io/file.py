@@ -142,6 +142,18 @@ class Writer:
         """
         return True
 
+    def readable(self) -> bool:
+        """
+        Return True if the stream supports reading.
+        """
+        return False
+
+    def seekable(self) -> bool:
+        """
+        Return True if the stream supports random access.
+        """
+        return False
+
     def flush(self) -> None:
         """
         Flush the write buffer, ensuring all data is sent to the stream.
@@ -260,6 +272,30 @@ class Reader:
         self._destroy_async_reader()
         self._stop_blocking_portal()
         self._is_open = False
+
+    def readable(self) -> bool:
+        """
+        Return True if the stream supports reading.
+        """
+        return True
+
+    def writable(self) -> bool:
+        """
+        Return True if the stream supports writing.
+        """
+        return False
+
+    def seekable(self) -> bool:
+        """
+        Return True if the stream supports random access.
+        """
+        return False
+
+    def flush(self) -> None:
+        """
+        No-op flush for Reader (for API compatibility).
+        """
+        pass
 
     @property
     def closed(self) -> bool:
