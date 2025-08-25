@@ -26,7 +26,7 @@ async def async_main(stream_path, access_token, block_size, timeout):
             AsyncReader(stream_path=stream_path, access_token=access_token, connect_timeout=timeout) as reader,
             anyio.wrap_file(sys.stdout.buffer) as f
         ):
-            while data := await reader.read_exactly(block_size):
+            while data := await reader.read_variable_block(block_size):
                 await f.write(data)
     except Exception as e:
         logging.error(f"Broken stream: {e}")

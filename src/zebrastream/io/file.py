@@ -260,7 +260,13 @@ class Reader:
         if not self._is_open:
             raise RuntimeError("Reader is not open")
         logger.debug(f"Reading up to {size} bytes")
-        return self._call_async(self._async_reader.read_exactly, size)
+        if size == 0:
+            # Read zero bytes, return empty bytes
+            return b""
+        if size < 0:
+            # Read until EOF
+            return self._call_async(self._async_reader.read_all)
+        return self._call_async(self._async_reader.read_variable_block, size)
 
     def close(self) -> None:
         """

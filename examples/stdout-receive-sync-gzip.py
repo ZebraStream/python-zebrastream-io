@@ -4,7 +4,7 @@ from gzip import GzipFile
 
 import typer
 
-from zebrastream.io.file import Writer
+import zebrastream.io.file as zsfile
 
 app = typer.Typer()
 
@@ -12,15 +12,15 @@ app = typer.Typer()
 def main(
     stream_path: str = typer.Argument(..., help="ZebraStream stream path (e.g., '/my-stream')"),
     access_token: str = typer.Option(..., help="Access token for Authorization header"),
-    content_type: str = typer.Option("text/plain", help="Content-Type for the HTTP request"),
     block_size: int = typer.Option(4096, help="Size of data blocks to read from stdin (default: 4096 bytes)"),
     timeout: int = typer.Option(None, help="Connect timeout in seconds (default: None)"),
 ):
-    """Read data from stdin and stream it to ZebraStream using AsyncWriter."""
-    with Writer(stream_path=stream_path, access_token=access_token, content_type=content_type, connect_timeout=timeout) as writer:
-        with GzipFile(fileobj=writer, mode="wb") as fz:
-            while data := sys.stdin.buffer.read(block_size):
-                fz.write(data)
+    """Read data from ZebraStream and write it to stdout."""
+    with zsfile.open(mode="rb", stream_path=stream_path, access_token=access_token, connect_timeout=timeout) as reader:
+        with GzipFile(fileobj=reader, mode="rb") as fz:
+            while data := fz.read(block_size):
+                sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
 
 if __name__ == "__main__":
     app()

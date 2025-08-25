@@ -327,17 +327,26 @@ class AsyncReader:
         self.is_started = False
         logger.debug("AsyncReader stopped")
 
-    async def read_exactly(self, n: int) -> bytes:
+    async def read_fixed_block(self, n: int) -> bytes:
         """
-        Read exactly n bytes from the ZebraStream data stream asynchronously.
+        Read a fixed block of n bytes from the ZebraStream data stream asynchronously.
+        
+        This method attempts to read exactly n bytes. It will return fewer than n bytes
+        (or zero bytes) only if the stream reaches EOF before n bytes are available.
 
         Args:
-            n (int): Number of bytes to read.
+            n (int): Number of bytes to read. Must be > 0.
         Returns:
-            bytes: The data read from the stream.
+            bytes: The data read from the stream. Returns exactly n bytes unless EOF is
+                   reached, in which case it returns all remaining bytes (possibly fewer
+                   than n, or empty bytes if no data remains).
         Raises:
+            ValueError: If n <= 0.
             Exception: If an error occurs during reading.
         """
+        if n <= 0:
+            raise ValueError("n must be positive")
+            
         while len(self._buffer) < n and not self._eof:
             if self._exception:
                 raise self._exception
@@ -345,10 +354,72 @@ class AsyncReader:
             self._read_event.clear()
         if not self._buffer and self._eof:
             return b''
-        data = self._buffer[:n]
-        self._buffer = self._buffer[n:]
-        return bytes(data)
+        data = bytes(memoryview(self._buffer)[:n])
+        del self._buffer[:n] 
+        return data
 
+    async def read_variable_block(self, n: int) -> bytes:
+        """
+        Read up to n bytes of available data from the ZebraStream data stream asynchronously.
+        
+        This method returns immediately with whatever data is available, up to n bytes.
+        
+        Args:
+            n (int): Maximum number of bytes to read. Must be > 0.
+        Returns:
+            bytes: The data read from the stream. Returns up to n bytes of available data,
+               or empty bytes if EOF is reached.
+        Raises:
+            ValueError: If n <= 0.
+            Exception: If an error occurs during reading.
+        """
+        if n <= 0:
+            raise ValueError("n must be positive")
+        
+        # Wait until we have some data or reach EOF
+        while not self._buffer and not self._eof:
+            if self._exception:
+                raise self._exception
+            await self._read_event.wait()
+            self._read_event.clear()
+            
+        # Check for exception one more time after waiting
+        if self._exception:
+            raise self._exception
+        
+        # Return whatever data we have available, up to n bytes
+        if not self._buffer:
+            return b''
+            
+        data = bytes(memoryview(self._buffer)[:n])
+        del self._buffer[:n] 
+        return data
+
+    async def read_all(self) -> bytes:
+        """
+        Read all remaining data until EOF.
+        
+        Returns:
+            bytes: All remaining data in the stream.
+        Raises:
+            Exception: If an error occurs during reading.
+        """
+        # Wait until EOF is reached and all data is buffered
+        while not self._eof:
+            if self._exception:
+                raise self._exception
+            await self._read_event.wait()
+            self._read_event.clear()
+
+
+        # Return all buffered data
+        if not self._buffer:
+            return b''
+
+        data = bytes(self._buffer)
+        self._buffer.clear()
+        return data
+    
     async def _download(self) -> None:
         # TODO: match content type, ot raise exception
         headers = {}
