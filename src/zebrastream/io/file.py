@@ -7,7 +7,9 @@ standard file-like interfaces. The wrappers use AnyIO's blocking portal to bridg
 sync and async code, supporting context management and typical file operations.
 """
 
+import atexit
 import logging
+import threading
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar, overload
 
@@ -18,7 +20,185 @@ from ._core import AsyncReader, AsyncWriter
 logger = logging.getLogger(__name__)
 T = TypeVar('T')
 
-# TODO: portal owning base class for sync wrappers
+class _SyncWrapperBase:
+    """Base class for synchronous ZebraStream wrappers."""
+    
+    _instances = set()
+    _instances_lock = threading.Lock()
+    
+    _async_instance: AsyncReader | AsyncWriter
+    _blocking_portal: Any  # FIX: AnyIO type
+    _blocking_portal_cm: Any  # FIX: AnyIO type
+    _is_open: bool
+
+    def __init__(self, async_factory: Callable[[], AsyncReader | AsyncWriter]) -> None:
+        """
+        Initialize a synchronous ZebraStream wrapper.
+        
+        Args:
+            async_factory: Function that creates the async instance
+        """
+        logger.debug(f"Initializing sync {self.__class__.__name__}")
+        self._async_factory = async_factory
+        self._is_open = False  # Set early for __del__ safety
+        
+        # Register for cleanup
+        with self._instances_lock:
+            self._instances.add(self)
+        
+        try:
+            self._start_blocking_portal()
+            self._create_async_instance()
+            self._is_open = True
+        except:
+            # Clean up any partial initialization
+            self._cleanup_on_error()
+            raise
+
+    def _start_blocking_portal(self) -> None:
+        """Start the anyio blocking portal."""
+        self._blocking_portal = anyio.from_thread.start_blocking_portal("asyncio")
+        self._blocking_portal_cm = self._blocking_portal.__enter__()
+
+    def _stop_blocking_portal(self) -> None:
+        """Stop the anyio blocking portal."""
+        self._blocking_portal.__exit__(None, None, None)
+        del self._blocking_portal_cm
+        del self._blocking_portal
+
+    @overload  
+    def _call_async(self, callable: Callable[..., Awaitable[T]], *args: Any, **kwargs: Any) -> T: ...
+    
+    @overload
+    def _call_async(self, callable: Callable[..., T], *args: Any, **kwargs: Any) -> T: ...
+
+    def _call_async(self, callable: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run a callable in the blocking portal."""
+        return self._blocking_portal_cm.call(callable, *args, **kwargs)
+
+    def _create_async_instance(self) -> None:
+        """Create an async instance."""
+        self._async_instance = self._call_async(self._async_factory)
+        self._call_async(self._async_instance.start)
+
+    def _destroy_async_instance(self) -> None:
+        """Destroy the async instance."""
+        self._call_async(self._async_instance.stop)
+        del self._async_instance
+
+    def _cleanup_on_error(self) -> None:
+        """Clean up any partial initialization on error."""
+        errors = []
+        
+        # Clean up async instance if it exists
+        if hasattr(self, "_async_instance"):
+            try:
+                self._destroy_async_instance()
+            except Exception as e:
+                errors.append(e)
+        
+        # Clean up portal if it exists
+        if hasattr(self, "_blocking_portal"):
+            try:
+                self._stop_blocking_portal()
+            except Exception as e:
+                errors.append(e)
+        
+        # Log errors but don't raise (we're already in error handling)
+        for error in errors:
+            logger.exception("Error during cleanup: %s", error)
+
+    def close(self) -> None:
+        """Close the stream and release all resources."""
+        if not self._is_open:
+            return  # Already closed, no-op
+            
+        logger.debug(f"Closing sync {self.__class__.__name__}")
+        errors = []
+        
+        # Clean up in reverse order of creation
+        try:
+            self._destroy_async_instance()
+        except Exception as e:
+            errors.append(e)
+            logger.exception("Error stopping async instance")
+        
+        try:
+            self._stop_blocking_portal()
+        except Exception as e:
+            errors.append(e)
+            logger.exception("Error stopping blocking portal")
+        
+        self._is_open = False
+        
+        # Unregister from cleanup
+        with self._instances_lock:
+            self._instances.discard(self)
+        
+        # Re-raise first error if any occurred
+        if errors:
+            raise errors[0]
+
+    @property
+    def closed(self) -> bool:
+        """
+        Return True if the stream is closed.
+        """
+        return not self._is_open
+
+    def __enter__(self) -> "_SyncWrapperBase":
+        """
+        Enter the runtime context related to this object.
+        Returns:
+            _SyncWrapperBase: self
+        """
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> None:
+        """
+        Exit the runtime context and close the stream.
+        
+        Ensures cleanup happens even if there was an exception in the context.
+        """
+        try:
+            self.close()
+        except Exception as close_error:
+            # Log but don't mask original exception
+            if exc_type is None:
+                # No original exception, re-raise our close error
+                raise close_error
+            else:
+                # There was an original exception, just log ours
+                logger.exception("Error during context manager exit (original exception will be raised)")
+                # Original exception will be re-raised automatically
+
+    def __del__(self) -> None:
+        """Ensure resources are cleaned up if object is garbage collected."""
+        try:
+            if getattr(self, "_is_open", False):
+                logger.warning(f"Emergency cleanup of {self.__class__.__name__} in __del__")
+                self.close()
+        except Exception:
+            # Can't raise in __del__, just log if possible
+            try:
+                logger.exception("Error during emergency cleanup in __del__")
+            except:
+                pass  # Even logging might fail during shutdown
+
+
+@atexit.register
+def _cleanup_all_instances():
+    """Clean up any remaining instances at exit."""
+    with _SyncWrapperBase._instances_lock:
+        instances = list(_SyncWrapperBase._instances)
+    
+    for instance in instances:
+        try:
+            if instance._is_open:
+                logger.info(f"Cleaning up {instance.__class__.__name__} during shutdown")
+                instance.close()
+        except Exception:
+            logger.exception(f"Error cleaning up {instance.__class__.__name__} during shutdown")
 
 
 def open(mode: str, **kwargs: Any) -> "Reader | Writer":
@@ -49,13 +229,12 @@ def open(mode: str, **kwargs: Any) -> "Reader | Writer":
         logger.error(f"Unsupported mode: {mode!r}")
         raise ValueError(f"Unsupported mode: {mode!r}. Only 'rb' and 'wb' are supported.")
 
-# TODO: use AnyIO async context manager wrapper for simpler code, avoid calling private methods
-class Writer:
-    _async_writer_factory: Callable[[], AsyncWriter]
-    _async_writer: AsyncWriter
-    _blocking_portal: Any  # FIX: AnyIO type
-    _blocking_portal_cm: Any  # FIX: AnyIO type
-    _is_open: bool
+class Writer(_SyncWrapperBase):
+    """
+    Synchronous writer for ZebraStream data streams.
+    """
+    
+    _async_instance: AsyncWriter  # More specific type for better IDE support
 
     def __init__(self, **kwargs: Any) -> None:
         """
@@ -64,52 +243,7 @@ class Writer:
         Args:
             **kwargs: Arguments passed to the underlying AsyncWriter (e.g., stream_path, access_token, content_type, connect_timeout).
         """
-        logger.debug("Initializing sync Writer")
-        self._async_writer_factory = lambda: AsyncWriter(**kwargs)
-        self._is_open = False
-        self._open()
-    
-    def _start_blocking_portal(self) -> None:
-        """Start the anyio blocking portal."""
-        assert not hasattr(self, "_blocking_portal"), "Portal is already started"  # TODO: remove assert, cannot happen internally
-        self._blocking_portal = anyio.from_thread.start_blocking_portal("asyncio")
-        self._blocking_portal_cm = self._blocking_portal.__enter__()
-    
-    def _stop_blocking_portal(self) -> None:
-        """Stop the anyio blocking portal."""
-        assert hasattr(self, "_blocking_portal"), "Portal is not started"  # TODO: remove assert, cannot happen internally
-        del self._blocking_portal_cm  # TODO: needed?
-        self._blocking_portal.__exit__(None, None, None)
-
-    @overload  
-    def _call_async(self, callable: Callable[..., Awaitable[T]], *args: Any, **kwargs: Any) -> T: ...
-    
-    @overload
-    def _call_async(self, callable: Callable[..., T], *args: Any, **kwargs: Any) -> T: ...
-
-    def _call_async(self, callable: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Run a callable in the blocking portal."""
-        assert hasattr(self, "_blocking_portal"), "Portal is not started"
-        return self._blocking_portal_cm.call(callable, *args, **kwargs)
-    
-    def _create_async_writer(self) -> None:
-        """Create an AsyncWriter instance."""
-        assert not hasattr(self, "_async_writer"), "AsyncZebraStreamWriter is already created"  # TODO: remove assert, cannot happen internally
-        self._async_writer = self._call_async(self._async_writer_factory)
-        self._call_async(self._async_writer.start)  # TODO: use async context manager instead?
-    
-    def _destroy_async_writer(self) -> None:
-        """Destroy the AsyncWriter instance."""
-        self._call_async(self._async_writer.stop)
-        del self._async_writer  # TODO: needed?
-
-    def _open(self) -> None:
-        # TODO: merge into init?
-        assert not self._is_open, "Writer is already open" # TODO: remove, cannot happen internally
-        logger.debug("Opening sync Writer")
-        self._start_blocking_portal()
-        self._create_async_writer()
-        self._is_open = True
+        super().__init__(lambda: AsyncWriter(**kwargs))
 
     def write(self, data: bytes) -> None:
         """
@@ -123,18 +257,7 @@ class Writer:
         if not self._is_open:
             raise RuntimeError("Writer is not open")
         logger.debug(f"Writing {len(data)} bytes")
-        self._call_async(self._async_writer.write, data)
-
-    def close(self) -> None:
-        """
-        Close the writer and release all resources.
-        """
-        if not self._is_open:
-            raise RuntimeError("Writer is not open")
-        logger.debug("Closing sync Writer")
-        self._destroy_async_writer()
-        self._stop_blocking_portal()
-        self._is_open = False
+        self._call_async(self._async_instance.write, data)
 
     def writable(self) -> bool:
         """
@@ -160,37 +283,15 @@ class Writer:
         """
         if not self._is_open:
             raise RuntimeError("Writer is not open")
-        self._call_async(self._async_writer.flush)
-
-    @property
-    def closed(self) -> bool:
-        """
-        Return True if the writer is closed.
-        """
-        return not self._is_open
-
-    def __enter__(self) -> "Writer":
-        """
-        Enter the runtime context related to this object.
-        Returns:
-            Writer: self
-        """
-        return self
-
-    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> None:
-        """
-        Exit the runtime context and close the writer.
-        """
-        self.close()
+        self._call_async(self._async_instance.flush)
 
 
-# TODO: use AnyIO async context manager wrapper for simpler code, avoid calling private methods
-class Reader:
-    _async_reader_factory: Callable[[], AsyncReader]
-    _async_reader: AsyncReader
-    _blocking_portal: Any  # FIX: AnyIO type
-    _blocking_portal_cm: Any  # FIX: AnyIO type
-    _is_open: bool
+class Reader(_SyncWrapperBase):
+    """
+    Synchronous reader for ZebraStream data streams.
+    """
+    
+    _async_instance: AsyncReader  # More specific type for better IDE support
 
     def __init__(self, **kwargs: Any) -> None:
         """
@@ -199,52 +300,7 @@ class Reader:
         Args:
             **kwargs: Arguments passed to the underlying AsyncReader (e.g., stream_path, access_token, content_type, connect_timeout).
         """
-        logger.debug("Initializing sync Reader")
-        self._async_reader_factory = lambda: AsyncReader(**kwargs)
-        self._is_open = False
-        self._open()
-    
-    def _start_blocking_portal(self) -> None:
-        """Start the anyio blocking portal."""
-        assert not hasattr(self, "_blocking_portal"), "Portal is already started"  # TODO: remove assert, cannot happen internally
-        self._blocking_portal = anyio.from_thread.start_blocking_portal("asyncio")
-        self._blocking_portal_cm = self._blocking_portal.__enter__()
-    
-    def _stop_blocking_portal(self) -> None:
-        """Stop the anyio blocking portal."""
-        assert hasattr(self, "_blocking_portal"), "Portal is not started"  # TODO: remove assert, cannot happen internally
-        del self._blocking_portal_cm  # TODO: needed?
-        self._blocking_portal.__exit__(None, None, None)
-    
-    @overload  
-    def _call_async(self, callable: Callable[..., Awaitable[T]], *args: Any, **kwargs: Any) -> T: ...
-    
-    @overload
-    def _call_async(self, callable: Callable[..., T], *args: Any, **kwargs: Any) -> T: ...
-
-    def _call_async(self, callable: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Run a callable in the blocking portal."""
-        assert hasattr(self, "_blocking_portal"), "Portal is not started"
-        return self._blocking_portal_cm.call(callable, *args, **kwargs)
-    
-    def _create_async_reader(self) -> None:
-        """Create an AsyncReader instance."""
-        assert not hasattr(self, "_async_reader"), "AsyncZebraStreamReader is already created"  # TODO: remove assert, cannot happen internally
-        self._async_reader = self._call_async(self._async_reader_factory)
-        self._call_async(self._async_reader.start)  # TODO: use async context manager instead?
-    
-    def _destroy_async_reader(self) -> None:
-        """Destroy the AsyncReader instance."""
-        self._call_async(self._async_reader.stop)
-        del self._async_reader  # TODO: needed?
-
-    def _open(self) -> None:
-        # TODO: merge into init?
-        assert not self._is_open, "Reader is already open" # TODO: remove, cannot happen internally
-        logger.debug("Opening sync Reader")
-        self._start_blocking_portal()
-        self._create_async_reader()
-        self._is_open = True
+        super().__init__(lambda: AsyncReader(**kwargs))
 
     def read(self, size: int = -1) -> bytes:
         """
@@ -265,19 +321,8 @@ class Reader:
             return b""
         if size < 0:
             # Read until EOF
-            return self._call_async(self._async_reader.read_all)
-        return self._call_async(self._async_reader.read_variable_block, size)
-
-    def close(self) -> None:
-        """
-        Close the reader and release all resources.
-        """
-        if not self._is_open:
-            raise RuntimeError("Reader is not open")
-        logger.debug("Closing sync Reader")
-        self._destroy_async_reader()
-        self._stop_blocking_portal()
-        self._is_open = False
+            return self._call_async(self._async_instance.read_all)
+        return self._call_async(self._async_instance.read_variable_block, size)
 
     def readable(self) -> bool:
         """
@@ -302,24 +347,3 @@ class Reader:
         No-op flush for Reader (for API compatibility).
         """
         pass
-
-    @property
-    def closed(self) -> bool:
-        """
-        Return True if the reader is closed.
-        """
-        return not self._is_open
-
-    def __enter__(self) -> "Reader":
-        """
-        Enter the runtime context related to this object.
-        Returns:
-            Reader: self
-        """
-        return self
-
-    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> None:
-        """
-        Exit the runtime context and close the reader.
-        """
-        self.close()
