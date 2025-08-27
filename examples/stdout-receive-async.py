@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+"""
+ZebraStream Async Receive to Stdout Example
+
+This script demonstrates how to asynchronously receive data from a ZebraStream
+endpoint and write it to stdout using the low-level AsyncReader class. It reads
+data in configurable blocks and outputs it in real-time.
+
+This example showcases:
+- Async/await pattern for non-blocking data consumption
+- Direct use of the AsyncReader core class
+- Configurable block size for performance tuning
+- Real-time data reception without buffering delays
+
+Usage:
+    python stdout-receive-async.py <stream_path> --access-token <token> [OPTIONS]
+
+Example:
+    python stdout-receive-async.py "/my-stream" --access-token "abc123" > output.txt
+    python stdout-receive-async.py "/data-stream" --access-token "abc123" --block-size 8192 | grep "ERROR"
+"""
+
 import asyncio
 import logging
 import sys
@@ -30,6 +51,7 @@ async def async_main(stream_path, access_token, block_size, timeout):
                 await f.write(data)
     except Exception as e:
         logging.error(f"Broken stream: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     app()

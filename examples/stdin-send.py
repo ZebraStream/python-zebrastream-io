@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+"""
+ZebraStream Basic Stdin Send Example
+
+This script demonstrates the most basic way to stream data from stdin to a ZebraStream
+endpoint using the file-like interface. It reads data in configurable blocks and
+streams it efficiently with minimal code complexity.
+
+This example showcases:
+- File-like interface for familiar Python I/O patterns
+- Configurable block size for performance tuning
+- Simple streaming with automatic resource management
+- Basic binary mode streaming
+
+Usage:
+    python stdin-send.py <stream_path> --access-token <token> [OPTIONS]
+
+Example:
+    echo "Hello World" | python stdin-send.py "/my-stream" --access-token "abc123"
+    cat document.pdf | python stdin-send.py "/files/document" --access-token "abc123" --content-type "application/pdf"
+"""
+
 import sys
 
 import typer

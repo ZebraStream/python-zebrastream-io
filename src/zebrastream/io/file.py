@@ -8,10 +8,12 @@ sync and async code, supporting context management and typical file operations.
 """
 
 import atexit
+import io
 import logging
 import threading
+import weakref
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar, overload
+from typing import Any, BinaryIO, TextIO, TypeVar, overload
 
 import anyio
 
@@ -20,146 +22,185 @@ from ._core import AsyncReader, AsyncWriter
 logger = logging.getLogger(__name__)
 T = TypeVar('T')
 
-class _SyncWrapperBase:
-    """Base class for synchronous ZebraStream wrappers."""
+class _PortalManager:
+    """Manages anyio blocking portal lifecycle."""
     
-    _instances = set()
-    _instances_lock = threading.Lock()
+    # Class-level type annotations - use WeakSet to avoid reference leaks
+    _instances: weakref.WeakSet['_PortalManager'] = weakref.WeakSet()
+    _instances_lock: threading.Lock = threading.Lock()
     
-    _async_instance: AsyncReader | AsyncWriter
     _blocking_portal: Any  # FIX: AnyIO type
     _blocking_portal_cm: Any  # FIX: AnyIO type
-    _is_open: bool
 
-    def __init__(self, async_factory: Callable[[], AsyncReader | AsyncWriter]) -> None:
-        """
-        Initialize a synchronous ZebraStream wrapper.
+    def __init__(self) -> None:
+        """Initialize and start the blocking portal."""
+        logger.debug("Initializing PortalManager")
         
-        Args:
-            async_factory: Function that creates the async instance
-        """
-        logger.debug(f"Initializing sync {self.__class__.__name__}")
-        self._async_factory = async_factory
-        self._is_open = False  # Set early for __del__ safety
-        
-        # Register for cleanup
+        # Register for cleanup - WeakSet doesn't keep strong references
         with self._instances_lock:
             self._instances.add(self)
         
-        try:
-            self._start_blocking_portal()
-            self._create_async_instance()
-            self._is_open = True
-        except:
-            # Clean up any partial initialization
-            self._cleanup_on_error()
-            raise
+        # If this succeeds, object is guaranteed to be fully initialized
+        self._open_blocking_portal()
 
-    def _start_blocking_portal(self) -> None:
+    def _open_blocking_portal(self) -> None:
         """Start the anyio blocking portal."""
         self._blocking_portal = anyio.from_thread.start_blocking_portal("asyncio")
         self._blocking_portal_cm = self._blocking_portal.__enter__()
 
-    def _stop_blocking_portal(self) -> None:
+    def _close_blocking_portal(self) -> None:
         """Stop the anyio blocking portal."""
         self._blocking_portal.__exit__(None, None, None)
         del self._blocking_portal_cm
         del self._blocking_portal
 
     @overload  
-    def _call_async(self, callable: Callable[..., Awaitable[T]], *args: Any, **kwargs: Any) -> T: ...
+    def call(self, callable: Callable[..., Awaitable[T]], *args: Any, **kwargs: Any) -> T: ...
     
     @overload
-    def _call_async(self, callable: Callable[..., T], *args: Any, **kwargs: Any) -> T: ...
+    def call(self, callable: Callable[..., T], *args: Any, **kwargs: Any) -> T: ...
 
-    def _call_async(self, callable: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    def call(self, callable: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Run a callable in the blocking portal."""
         return self._blocking_portal_cm.call(callable, *args, **kwargs)
 
-    def _create_async_instance(self) -> None:
-        """Create an async instance."""
-        self._async_instance = self._call_async(self._async_factory)
-        self._call_async(self._async_instance.start)
-
-    def _destroy_async_instance(self) -> None:
-        """Destroy the async instance."""
-        self._call_async(self._async_instance.stop)
-        del self._async_instance
-
-    def _cleanup_on_error(self) -> None:
-        """Clean up any partial initialization on error."""
-        errors = []
-        
-        # Clean up async instance if it exists
-        if hasattr(self, "_async_instance"):
-            try:
-                self._destroy_async_instance()
-            except Exception as e:
-                errors.append(e)
-        
-        # Clean up portal if it exists
-        if hasattr(self, "_blocking_portal"):
-            try:
-                self._stop_blocking_portal()
-            except Exception as e:
-                errors.append(e)
-        
-        # Log errors but don't raise (we're already in error handling)
-        for error in errors:
-            logger.exception("Error during cleanup: %s", error)
-
-    def close(self) -> None:
-        """Close the stream and release all resources."""
-        if not self._is_open:
-            return  # Already closed, no-op
+    def __del__(self) -> None:
+        """Clean up portal when object is destroyed."""
+        try:
+            logger.debug("Cleaning up PortalManager in destructor")
+            self._close_blocking_portal()
             
-        logger.debug(f"Closing sync {self.__class__.__name__}")
-        errors = []
-        
-        # Clean up in reverse order of creation
-        try:
-            self._destroy_async_instance()
-        except Exception as e:
-            errors.append(e)
-            logger.exception("Error stopping async instance")
-        
-        try:
-            self._stop_blocking_portal()
-        except Exception as e:
-            errors.append(e)
-            logger.exception("Error stopping blocking portal")
-        
-        self._is_open = False
-        
-        # Unregister from cleanup
-        with self._instances_lock:
-            self._instances.discard(self)
-        
-        # Re-raise first error if any occurred
-        if errors:
-            raise errors[0]
+            # No need to manually unregister - WeakSet handles it automatically
+                
+        except Exception:
+            logger.exception("Error during PortalManager cleanup")
 
-    @property
-    def closed(self) -> bool:
-        """
-        Return True if the stream is closed.
-        """
-        return not self._is_open
 
-    def __enter__(self) -> "_SyncWrapperBase":
+class _AsyncInstanceManager:
+    """Manages async instance lifecycle using a portal manager."""
+    
+    # Instance-level type annotations
+    portal: _PortalManager
+    instance: AsyncReader | AsyncWriter
+    _owns_portal: bool
+
+    def __init__(self, async_factory: Callable[[], AsyncReader | AsyncWriter], portal_manager: _PortalManager | None = None) -> None:
         """
-        Enter the runtime context related to this object.
-        Returns:
-            _SyncWrapperBase: self
+        Initialize async instance manager.
+        
+        Args:
+            async_factory: Function that creates the async instance
+            portal_manager: Portal manager to use (creates new one if None)
         """
+        logger.debug("Initializing AsyncInstanceManager")
+        
+        # Use provided portal or create new one
+        if portal_manager is None:
+            self.portal = _PortalManager()
+            self._owns_portal = True
+        else:
+            self.portal = portal_manager
+            self._owns_portal = False
+        
+        # If this succeeds, object is guaranteed to be fully initialized
+        self.instance = self.portal.call(async_factory)
+        self.portal.call(self.instance.start)
+
+    def __del__(self) -> None:
+        """Clean up async instance when object is destroyed."""
+        try:
+            logger.debug("Cleaning up AsyncInstanceManager in destructor")
+            
+            # Stop async instance
+            try:
+                self.portal.call(self.instance.stop)
+            except Exception:
+                logger.exception("Error stopping async instance")
+        
+            # Clean up owned portal
+            if self._owns_portal:
+                try:
+                    del self.portal
+                except Exception:
+                    logger.exception("Error cleaning up portal")
+                
+        except Exception:
+            logger.exception("Error during AsyncInstanceManager cleanup")
+
+
+@atexit.register
+def _cleanup_portal_instances():
+    """Clean up any remaining instances at exit."""
+    while _PortalManager._instances:
+        with _PortalManager._instances_lock:
+            try:
+                instance = _PortalManager._instances.pop()
+            except KeyError:
+                break  # Set became empty (shouldn't happen due to while condition)
+        
+        # Cleanup outside lock
+        try:
+            logger.debug(f"Emergency cleanup of {instance.__class__.__name__}")
+            del instance  # Triggers __del__() properly
+        except Exception:
+            logger.exception("Error cleaning up instance during shutdown")
+
+
+def open(mode: str, encoding: str = "utf-8", **kwargs: Any) -> "TextIO | BinaryIO":
+    """
+    Open a ZebraStream stream path for reading or writing.
+
+    Args:
+        mode (str): Mode to open the stream. 'r'/'rt'/'rb' for reading, 'w'/'wt'/'wb' for writing.
+        encoding (str): Text encoding. Only used for text modes. Default: 'utf-8'.
+        **kwargs: Additional arguments passed to the corresponding Reader or Writer class.
+        These may include:
+        stream_path (str): The ZebraStream stream path (e.g., '/my-stream').
+        access_token (str, optional): Access token for authentication.
+        content_type (str, optional): Content type for the stream.
+        connect_timeout (int, optional): Timeout in seconds for the connect operation.
+
+    Returns:
+        TextIO or BinaryIO: Text wrapper for text modes, binary Reader/Writer for binary modes.
+        
+    Note:
+        Data may be buffered internally for efficiency. For immediate transmission in write modes,
+        call flush() after write() operations.
+
+    Raises:
+        ValueError: If mode is not supported.
+    """
+    logger.debug(f"Opening ZebraStream in mode '{mode}'")
+    
+    # Normalize mode
+    if mode in ("r", "rt"):
+        # Text read mode
+        binary_reader = Reader(**kwargs)
+        return io.TextIOWrapper(binary_reader, encoding=encoding)
+    elif mode == "rb":
+        # Binary read mode
+        return Reader(**kwargs)
+    elif mode in ("w", "wt"):
+        # Text write mode
+        binary_writer = Writer(**kwargs)
+        return io.TextIOWrapper(binary_writer, encoding=encoding)
+    elif mode == "wb":
+        # Binary write mode
+        return Writer(**kwargs)
+    else:
+        logger.error(f"Unsupported mode: {mode!r}")
+        raise ValueError(f"Unsupported mode: {mode!r}. Supported: 'r', 'rt', 'rb', 'w', 'wt', 'wb'.")
+
+
+class _BinaryIOBase(BinaryIO):
+    """Base class that implements BinaryIO interface for ZebraStream objects."""
+    
+    def __enter__(self) -> BinaryIO:
+        """Return self as BinaryIO for context manager."""
         return self
 
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> None:
-        """
-        Exit the runtime context and close the stream.
-        
-        Ensures cleanup happens even if there was an exception in the context.
-        """
+        """Exit the runtime context and close the stream."""
         try:
             self.close()
         except Exception as close_error:
@@ -172,69 +213,54 @@ class _SyncWrapperBase:
                 logger.exception("Error during context manager exit (original exception will be raised)")
                 # Original exception will be re-raised automatically
 
-    def __del__(self) -> None:
-        """Ensure resources are cleaned up if object is garbage collected."""
-        try:
-            if getattr(self, "_is_open", False):
-                logger.warning(f"Emergency cleanup of {self.__class__.__name__} in __del__")
-                self.close()
-        except Exception:
-            # Can't raise in __del__, just log if possible
-            try:
-                logger.exception("Error during emergency cleanup in __del__")
-            except:
-                pass  # Even logging might fail during shutdown
-
-
-@atexit.register
-def _cleanup_all_instances():
-    """Clean up any remaining instances at exit."""
-    with _SyncWrapperBase._instances_lock:
-        instances = list(_SyncWrapperBase._instances)
+    # Implement required BinaryIO methods that can be shared
+    def readline(self, size: int = -1) -> bytes:
+        """Read a line from the stream."""
+        result = b""
+        while True:
+            char = self.read(1)
+            if not char or char == b'\n':
+                break
+            result += char
+            if size > 0 and len(result) >= size:
+                break
+        return result
     
-    for instance in instances:
-        try:
-            if instance._is_open:
-                logger.info(f"Cleaning up {instance.__class__.__name__} during shutdown")
-                instance.close()
-        except Exception:
-            logger.exception(f"Error cleaning up {instance.__class__.__name__} during shutdown")
+    def readlines(self, hint: int = -1) -> list[bytes]:
+        """Read lines from the stream."""
+        lines = []
+        while True:
+            line = self.readline()
+            if not line:
+                break
+            lines.append(line)
+        return lines
+    
+    def writelines(self, lines) -> None:
+        """Write lines to the stream."""
+        for line in lines:
+            self.write(line)
+    
+    # Unsupported operations for streams
+    def seek(self, offset: int, whence: int = 0) -> int:
+        raise io.UnsupportedOperation("seek")
+    
+    def tell(self) -> int:
+        raise io.UnsupportedOperation("tell")
+    
+    def truncate(self, size: int | None = None) -> int:
+        raise io.UnsupportedOperation("truncate")
 
 
-def open(mode: str, **kwargs: Any) -> "Reader | Writer":
-    """
-    Open a ZebraStream stream path for reading or writing.
-
-    Args:
-        mode (str): Mode to open the stream. 'rb' for reading, 'wb' for writing.
-        **kwargs: Additional arguments passed to the corresponding Reader or Writer class.
-        These may include:
-        stream_path (str): The ZebraStream stream path (e.g., '/my-stream').
-        access_token (str, optional): Access token for authentication.
-        content_type (str, optional): Content type for the stream.
-        connect_timeout (int, optional): Timeout in seconds for the connect operation.
-
-    Returns:
-        Reader or Writer: An instance of Reader (for 'rb') or Writer (for 'wb').
-
-    Raises:
-        ValueError: If mode is not 'rb' or 'wb'.
-    """
-    logger.debug(f"Opening ZebraStream in mode '{mode}'")
-    if mode == "rb":
-        return Reader(**kwargs)
-    elif mode == "wb":
-        return Writer(**kwargs)
-    else:
-        logger.error(f"Unsupported mode: {mode!r}")
-        raise ValueError(f"Unsupported mode: {mode!r}. Only 'rb' and 'wb' are supported.")
-
-class Writer(_SyncWrapperBase):
+class Writer(_BinaryIOBase):
     """
     Synchronous writer for ZebraStream data streams.
+    
+    Note: Data may be buffered internally. Use flush() for immediate transmission.
     """
     
-    _async_instance: AsyncWriter  # More specific type for better IDE support
+    # Instance-level type annotation
+    _async_manager: _AsyncInstanceManager | None
 
     def __init__(self, **kwargs: Any) -> None:
         """
@@ -243,55 +269,55 @@ class Writer(_SyncWrapperBase):
         Args:
             **kwargs: Arguments passed to the underlying AsyncWriter (e.g., stream_path, access_token, content_type, connect_timeout).
         """
-        super().__init__(lambda: AsyncWriter(**kwargs))
+        self._async_manager = _AsyncInstanceManager(lambda: AsyncWriter(**kwargs))
 
-    def write(self, data: bytes) -> None:
-        """
-        Write bytes to the ZebraStream data stream.
-
-        Args:
-            data (bytes): The data to write.
-        Raises:
-            RuntimeError: If the writer is not open.
-        """
-        if not self._is_open:
-            raise RuntimeError("Writer is not open")
-        logger.debug(f"Writing {len(data)} bytes")
-        self._call_async(self._async_instance.write, data)
-
-    def writable(self) -> bool:
-        """
-        Return True if the stream supports writing.
-        """
-        return True
-
-    def readable(self) -> bool:
-        """
-        Return True if the stream supports reading.
-        """
-        return False
-
-    def seekable(self) -> bool:
-        """
-        Return True if the stream supports random access.
-        """
-        return False
-
-    def flush(self) -> None:
-        """
-        Flush the write buffer, ensuring all data is sent to the stream.
-        """
-        if not self._is_open:
-            raise RuntimeError("Writer is not open")
-        self._call_async(self._async_instance.flush)
-
-
-class Reader(_SyncWrapperBase):
-    """
-    Synchronous reader for ZebraStream data streams.
-    """
+    def read(self, size: int = -1) -> bytes:
+        """Writers don't support reading."""
+        raise io.UnsupportedOperation("not readable")
     
-    _async_instance: AsyncReader  # More specific type for better IDE support
+    def write(self, data: bytes) -> int:
+        """
+        Write bytes. Data may be buffered - use flush() for immediate transmission.
+        """
+        if self._async_manager is None:
+            raise ValueError("I/O operation on closed file")
+            
+        logger.debug(f"Writing {len(data)} bytes")
+        self._async_manager.portal.call(self._async_manager.instance.write, data)
+        return len(data)
+    
+    def readable(self) -> bool:
+        return False  # General capability - never changes
+    
+    def writable(self) -> bool:
+        return True   # General capability - never changes
+    
+    def seekable(self) -> bool:
+        return False  # General capability - never changes
+    
+    def flush(self) -> None:
+        """Flush buffered data for immediate transmission."""
+        if self._async_manager is None:
+            raise ValueError("I/O operation on closed file")
+        self._async_manager.portal.call(self._async_manager.instance.flush)
+    
+    def close(self) -> None:
+        """Close the writer and release all resources."""
+        if self._async_manager is not None:
+            del self._async_manager  # Triggers immediate cleanup via __del__
+            self._async_manager = None
+    
+    @property 
+    def closed(self) -> bool:
+        """Required by BinaryIO interface."""
+        return self._async_manager is None
+
+
+class Reader(_BinaryIOBase):
+    """Synchronous reader for ZebraStream data streams."""
+    
+    # Instance-level type annotation
+    _async_manager: _AsyncInstanceManager | None
 
     def __init__(self, **kwargs: Any) -> None:
         """
@@ -300,50 +326,43 @@ class Reader(_SyncWrapperBase):
         Args:
             **kwargs: Arguments passed to the underlying AsyncReader (e.g., stream_path, access_token, content_type, connect_timeout).
         """
-        super().__init__(lambda: AsyncReader(**kwargs))
+        self._async_manager = _AsyncInstanceManager(lambda: AsyncReader(**kwargs))
 
+    def write(self, data: bytes) -> int:
+        """Readers don't support writing."""
+        raise io.UnsupportedOperation("not writable")
+    
     def read(self, size: int = -1) -> bytes:
-        """
-        Read bytes from the ZebraStream data stream.
-
-        Args:
-            size (int): Number of bytes to read. Default is -1 (read until EOF or available data).
-        Returns:
-            bytes: The data read from the stream.
-        Raises:
-            RuntimeError: If the reader is not open.
-        """
-        if not self._is_open:
-            raise RuntimeError("Reader is not open")
+        """Read bytes from the ZebraStream data stream."""
+        if self._async_manager is None:
+            raise ValueError("I/O operation on closed file")
+            
         logger.debug(f"Reading up to {size} bytes")
         if size == 0:
-            # Read zero bytes, return empty bytes
             return b""
         if size < 0:
-            # Read until EOF
-            return self._call_async(self._async_instance.read_all)
-        return self._call_async(self._async_instance.read_variable_block, size)
-
+            return self._async_manager.portal.call(self._async_manager.instance.read_all)
+        return self._async_manager.portal.call(self._async_manager.instance.read_variable_block, size)
+    
     def readable(self) -> bool:
-        """
-        Return True if the stream supports reading.
-        """
-        return True
-
+        return True   # General capability - never changes
+    
     def writable(self) -> bool:
-        """
-        Return True if the stream supports writing.
-        """
-        return False
-
+        return False  # General capability - never changes
+    
     def seekable(self) -> bool:
-        """
-        Return True if the stream supports random access.
-        """
-        return False
-
+        return False  # General capability - never changes
+    
     def flush(self) -> None:
-        """
-        No-op flush for Reader (for API compatibility).
-        """
-        pass
+        pass  # No-op for readers
+    
+    def close(self) -> None:
+        """Close the reader and release all resources."""
+        if self._async_manager is not None:
+            del self._async_manager  # Triggers immediate cleanup via __del__
+            self._async_manager = None
+    
+    @property
+    def closed(self) -> bool:
+        """Return True if the reader is closed."""
+        return self._async_manager is None

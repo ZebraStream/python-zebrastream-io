@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+"""
+ZebraStream Async Stdin Send Example
+
+This script demonstrates how to asynchronously stream data from stdin to a ZebraStream
+endpoint using the low-level AsyncWriter class. It reads data in configurable blocks
+and streams it in real-time without buffering.
+
+This example showcases:
+- Async/await pattern for non-blocking I/O
+- Direct use of the AsyncWriter core class
+- Configurable block size for performance tuning
+- Real-time streaming without intermediate buffering
+
+Usage:
+    python stdin-send-async.py <stream_path> --access-token <token> [OPTIONS]
+
+Example:
+    echo "Hello World" | python stdin-send-async.py "/my-stream" --access-token "abc123"
+    cat large-file.txt | python stdin-send-async.py "/data-stream" --access-token "abc123" --block-size 8192
+"""
+
 import asyncio
 import logging
 import sys
@@ -31,6 +52,7 @@ async def async_main(stream_path, access_token, content_type, block_size, timeou
                 await writer.write(data)
     except Exception as e:
         logging.error(f"Broken stream: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     app()

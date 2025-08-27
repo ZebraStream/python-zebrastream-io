@@ -10,7 +10,6 @@ over HTTP using the ZebraStream Connect API.
 # TODO: check what happens, if the HTTP requests fail
 # TODO: control queue capacity/size --> keep external for now (like StreamWriter)
 # TODO: better (library-independent) exceptions
-# TODO: use Connect API server side timeout parameter for refreshing and better server-side resource handling
 # TODO: use exponential backoff for connect procedure
 # TODO: add aiohttp TCP connect timeout?
 # TODO: signal premature disconnect as exception to user code
@@ -87,6 +86,25 @@ class AsyncWriter:
 
     This class provides an async interface for sending data to a ZebraStream endpoint. It manages connection setup,
     buffering, and upload tasks, and supports use as an async context manager.
+    
+    Buffering Behavior:
+        Data written via write() may be buffered internally for efficiency. This buffering can occur at multiple 
+        levels (text wrapper, internal queues, HTTP layer) and helps optimize network performance for bulk transfers.
+        
+        For applications requiring immediate data transmission (e.g., real-time logging, streaming), call flush() 
+        after write() to ensure data is sent immediately without waiting for internal buffers to fill.
+        
+    Examples:
+        # Real-time streaming - immediate transmission:
+        async with AsyncWriter(stream, access_token="my_token", mode="wt") as writer:
+            await writer.write("URGENT: system error\\n")
+            await writer.flush()  # Guarantees immediate sending
+            
+        # Bulk transfer - let buffering optimize performance:
+        async with AsyncWriter(stream, access_token="my_token", mode="wb") as writer:
+            for data in large_dataset:
+                await writer.write(data)  # Buffered for efficiency
+            # Implicit flush() on context exit
     """
 
     _CONNECT_MODE: str = "await-reader"
@@ -172,6 +190,9 @@ class AsyncWriter:
     async def write(self, data: bytes) -> None:
         """
         Write bytes to the ZebraStream data stream asynchronously.
+        
+        Note: Data may be buffered internally for efficiency. For immediate transmission,
+        call flush() after write() to ensure data is sent without delay.
 
         Args:
             data (bytes): The data to write.
@@ -191,7 +212,14 @@ class AsyncWriter:
         
     async def flush(self) -> None:
         """
-        Wait until all data in the transfer queue has been processed by the upload task.
+        Ensure all buffered data is sent immediately.
+        
+        This method waits until all data in the transfer queue has been processed by the upload task,
+        forcing any internal buffers to be transmitted. Only flush() guarantees immediate sending -
+        without it, data may be buffered for efficiency until internal thresholds are reached.
+        
+        Use flush() after write() for real-time applications where immediate data transmission
+        is required (e.g., log streaming, alerts, interactive applications).
         """
         await self._buffer.join()
 
@@ -252,6 +280,7 @@ class AsyncReader:
     _access_token: str | None
     _content_type: str | None
     _connect_timeout: int | None
+    _block_size: int
     _buffer: bytearray
     _read_event: asyncio.Event
     _download_task: asyncio.Task[None]
@@ -260,7 +289,7 @@ class AsyncReader:
     _eof: bool
     _exception: Exception | None
 
-    def __init__(self, stream_path: str, access_token: str | None = None, content_type: str | None = None, connect_timeout: int | None = None) -> None:
+    def __init__(self, stream_path: str, access_token: str | None = None, content_type: str | None = None, connect_timeout: int | None = None, block_size: int = 4096) -> None:
         """
         Initialize an asynchronous ZebraStream reader.
 
@@ -269,11 +298,16 @@ class AsyncReader:
             access_token (str, optional): Access token for authorization.
             content_type (str, optional): Content-Type for the HTTP request.
             connect_timeout (int, optional): Timeout in seconds for the connect operation.
+            block_size (int, optional): Size of data blocks to read from the HTTP response stream.
+                Smaller values (e.g., 1024) provide lower latency for real-time data like log lines.
+                Larger values (e.g., 32768) provide better throughput for bulk data transfers.
+                Default is 4096 bytes, which balances latency and throughput for most use cases.
         """
         self._stream_path = stream_path
         self._access_token = access_token
         self._content_type = content_type
         self._connect_timeout = connect_timeout
+        self._block_size = block_size
         self._buffer = bytearray()
         self._read_event = asyncio.Event()
         self.is_started = False
@@ -428,7 +462,7 @@ class AsyncReader:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(self._data_stream_url, headers=headers) as resp:
-                    async for chunk in resp.content.iter_chunked(4096):  # TODO: decide chunk size?
+                    async for chunk in resp.content.iter_chunked(self._block_size):
                         if not chunk:
                             break
                         self._buffer.extend(chunk)
