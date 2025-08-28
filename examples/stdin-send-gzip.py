@@ -20,8 +20,8 @@ Example:
     echo "Hello World" | python stdin-send-gzip.py "/my-stream" --access-token "abc123" --content-type "application/gzip"
 """
 
-import sys
 import logging
+import sys
 from gzip import GzipFile
 
 import typer

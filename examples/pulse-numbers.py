@@ -17,9 +17,9 @@ Example:
 """
 
 import itertools
+import logging
 import sys
 import time
-import logging
 
 import typer
 

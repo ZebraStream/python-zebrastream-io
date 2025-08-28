@@ -21,8 +21,8 @@ Example:
 """
 
 import itertools
-import sys
 import logging
+import sys
 
 import typer
 

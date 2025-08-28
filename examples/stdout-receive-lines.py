@@ -20,8 +20,8 @@ Example:
     python stdout-receive-lines.py "/live-logs" --access-token "abc123" > processed.log
 """
 
-import sys
 import logging
+import sys
 
 import typer
 
@@ -42,7 +42,7 @@ def main(
     try:
         with zsfile.open(mode="rt", stream_path=stream_path, access_token=access_token, connect_timeout=timeout, block_size=block_size) as f:
             for line in f:
-                sys.stdout.write(line)
+                print(line, end="")
     except Exception as e:
         logging.error(f"Broken stream: {e}")
         sys.exit(1)

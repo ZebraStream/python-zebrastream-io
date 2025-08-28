@@ -20,8 +20,8 @@ Example:
     python stdout-receive.py "/files/document" --access-token "abc123" > document.pdf
 """
 
-import sys
 import logging
+import sys
 
 import typer
 

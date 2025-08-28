@@ -27,8 +27,10 @@ The synchronous interface provides a familiar, file-like API for reading from an
 ```python
 import zebrastream.io.file as zsfile
 
-with zsfile.open(mode="wb", stream_path="/my-stream", access_token=token) as f:
-    f.write(b"Hello ZebraStream!")
+with zsfile.open(mode="w", stream_path="/my-stream", access_token=token) as f:
+    f.write("Hello!")
+    f.flush() # force send buffer
+    f.write("This is ZebraStream")
 ```
 
 #### Consumer
@@ -36,9 +38,9 @@ with zsfile.open(mode="wb", stream_path="/my-stream", access_token=token) as f:
 ```python
 import zebrastream.io.file as zsfile
 
-with zsfile.open(mode="rb", stream_path="/my-stream", access_token=token) as f:
-    data = f.read(1024)  # read 1024 bytes
-    # do something with the data
+with zsfile.open(mode="r", stream_path="/my-stream", access_token=token) as f:
+    for line in f:
+        print(line, end="")
 ```
 
 ### Async interface (internal)
@@ -57,7 +59,9 @@ import asyncio
 
 async def main():
     async with AsyncWriter(stream_path="/my-stream", access_token=token) as writer:
-        await writer.write(b"Hello ZebraStream!")
+        await writer.write(b"Hello!")
+        await writer.flush()
+        await writer.write("This is ZebraStream")
 
 asyncio.run(main())
 ```
@@ -70,8 +74,8 @@ import asyncio
 
 async def main():
     async with AsyncReader(stream_path="/my-stream", access_token=token) as reader:
-        data = await reader.read(1024)
-        # do something with the data
+        while data := await reader.read_variable_block(4096):
+            print(data.decode(), end="")
 
 asyncio.run(main())
 ```
