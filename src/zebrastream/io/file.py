@@ -10,10 +10,13 @@ sync and async code, supporting context management and typical file operations.
 import atexit
 import io
 import logging
+import os
+import tempfile
 import threading
 import weakref
 from collections.abc import Awaitable, Callable
-from typing import Any, BinaryIO, TextIO, TypeVar, overload
+from contextlib import contextmanager
+from typing import Any, BinaryIO, Generator, TextIO, TypeVar, overload
 
 import anyio
 
@@ -129,7 +132,7 @@ class _AsyncInstanceManager:
 
 
 @atexit.register
-def _cleanup_portal_instances():
+def _cleanup_portal_instances() -> None:
     """Clean up any remaining instances at exit."""
     while _PortalManager._instances:
         with _PortalManager._instances_lock:
@@ -146,40 +149,113 @@ def _cleanup_portal_instances():
             logger.exception("Error cleaning up instance during shutdown")
 
 
-def open(mode: str, encoding: str = "utf-8", **kwargs: Any) -> "TextIO | BinaryIO":
+@contextmanager
+def seekable_from_stream(stream: BinaryIO, chunk_size: int = 1024 * 1024) -> Generator[BinaryIO, None, None]:
+    """
+    Create a seekable file-like object from a sequential stream by buffering to disk.
+    
+    Args:
+        stream: Sequential binary stream to buffer
+        chunk_size: Size of chunks to read at a time (default: 1MB)
+        
+    Yields:
+        BinaryIO: Seekable file object backed by temporary file
+        
+    Note:
+        The temporary file is automatically cleaned up after the context exits.
+    """
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.dat', mode='w+b')
+    tmp_name = tmp.name
+    try:
+        logger.debug(f"Buffering stream to temporary file: {tmp_name}")
+        while chunk := stream.read(chunk_size):
+            tmp.write(chunk)
+        tmp.flush()
+        tmp.seek(0)
+        logger.debug(f"Stream buffered successfully ({tmp.tell()} bytes)")
+        yield tmp
+    finally:
+        tmp.close()
+        try:
+            os.unlink(tmp_name)
+            logger.debug(f"Temporary file cleaned up: {tmp_name}")
+        except OSError:
+            logger.warning(f"Failed to clean up temporary file: {tmp_name}")
+
+
+@contextmanager
+def _create_buffered_reader(binary_reader: BinaryIO, encoding: str | None, download_chunk_size: int) -> Generator[TextIO | BinaryIO, None, None]:
+    """
+    Create a buffered, seekable reader from a sequential binary reader.
+    
+    Args:
+        binary_reader: Sequential binary reader to buffer
+        encoding: Text encoding (None for binary mode)
+        download_chunk_size: Size of chunks to read when buffering
+        
+    Yields:
+        TextIO or BinaryIO: Seekable file object (text or binary)
+    """
+    with binary_reader as sequential:
+        with seekable_from_stream(sequential, download_chunk_size) as seekable:
+            if encoding is not None:
+                yield io.TextIOWrapper(seekable, encoding=encoding)
+            else:
+                yield seekable
+
+
+def open(mode: str, encoding: str = "utf-8", random_read: bool = False, download_chunk_size: int = 1024 * 1024, **kwargs: Any) -> "TextIO | BinaryIO":
     """
     Open a ZebraStream stream path for reading or writing.
 
     Args:
         mode (str): Mode to open the stream. 'r'/'rt'/'rb' for reading, 'w'/'wt'/'wb' for writing.
         encoding (str): Text encoding. Only used for text modes. Default: 'utf-8'.
+        random_read (bool): If True, buffers stream to temp file (1MB chunks) for seek/tell support.
+            Supports pandas.read_parquet(), PyArrow, ZIP, etc. Only applicable for read modes.
+        download_chunk_size (int): Size of chunks for streaming when random_read=True (default: 1MB).
         **kwargs: Additional arguments passed to the corresponding Reader or Writer class.
         These may include:
         stream_path (str): The ZebraStream stream path (e.g., '/my-stream').
         access_token (str, optional): Access token for authentication.
         content_type (str, optional): Content type for the stream.
         connect_timeout (int, optional): Timeout in seconds for the connect operation.
+        connect_api_url (str, optional): Base URL for the ZebraStream Connect API.
+            Defaults to the public ZebraStream cloud service.
 
     Returns:
         TextIO or BinaryIO: Text wrapper for text modes, binary Reader/Writer for binary modes.
+        When random_read=True, returns a context manager yielding a seekable file.
         
     Note:
         Data may be buffered internally for efficiency. For immediate transmission in write modes,
         call flush() after write() operations.
 
     Raises:
-        ValueError: If mode is not supported.
+        ValueError: If mode is not supported or random_read=True with write mode.
     """
-    logger.debug(f"Opening ZebraStream in mode '{mode}'")
+    logger.debug(f"Opening ZebraStream in mode '{mode}', random_read={random_read}")
+    
+    # Validate random_read usage
+    if random_read and mode not in ("r", "rt", "rb"):
+        logger.error("random_read=True only supported for read modes")
+        raise ValueError("random_read=True only supported for read modes ('r', 'rt', 'rb')")
     
     # Normalize mode
     if mode in ("r", "rt"):
         # Text read mode
         binary_reader = Reader(**kwargs)
-        return io.TextIOWrapper(binary_reader, encoding=encoding)
+        if random_read:
+            return _create_buffered_reader(binary_reader, encoding, download_chunk_size)
+        else:
+            return io.TextIOWrapper(binary_reader, encoding=encoding)
     elif mode == "rb":
         # Binary read mode
-        return Reader(**kwargs)
+        binary_reader = Reader(**kwargs)
+        if random_read:
+            return _create_buffered_reader(binary_reader, None, download_chunk_size)
+        else:
+            return binary_reader
     elif mode in ("w", "wt"):
         # Text write mode
         binary_writer = Writer(**kwargs)

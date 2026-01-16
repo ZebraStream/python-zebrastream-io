@@ -22,16 +22,20 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-ZEBRASTREAM_CONNECT_API_URL = "https://connect.zebrastream.io/v0/"
+# Default ZebraStream Connect API URL
+DEFAULT_ZEBRASTREAM_CONNECT_API_URL = "https://connect.zebrastream.io/v0/"
 
-async def _connect(stream_path: str, mode: str, access_token: str | None = None, connect_timeout: int | None = None) -> str:
+async def _connect(stream_path: str, mode: str, access_token: str | None = None, connect_timeout: int | None = None, connect_api_url: str = DEFAULT_ZEBRASTREAM_CONNECT_API_URL) -> str:
     """
     Establish a connection to the ZebraStream Connect API and get the data stream URL.
     
     Args:
         stream_path (str): The ZebraStream stream path (e.g., '/my-stream').
+        mode (str): Connection mode ('await-reader' or 'await-writer').
         access_token (str, optional): Access token for authorization.
         connect_timeout (int, optional): Timeout in seconds for the connect operation.
+        connect_api_url (str, optional): Base URL for the ZebraStream Connect API. 
+            Defaults to the public ZebraStream cloud service.
     
     Returns:
         str: The data stream URL for subsequent requests.
@@ -42,7 +46,7 @@ async def _connect(stream_path: str, mode: str, access_token: str | None = None,
     assert mode in {"await-reader", "await-writer"}, "Invalid mode specified. Use 'await-reader' or 'await-writer'."
     
     # Construct the full connect URL from the base URL and stream path
-    connect_url = ZEBRASTREAM_CONNECT_API_URL.rstrip('/') + stream_path
+    connect_url = connect_api_url.rstrip('/') + stream_path
     
     headers = {}
     if access_token:
@@ -112,13 +116,14 @@ class AsyncWriter:
     _access_token: str | None
     _content_type: str | None
     _connect_timeout: int | None
+    _connect_api_url: str
     _buffer: asyncio.Queue[bytes | None]
     _write_failed: bool
     _upload_task: asyncio.Task[None]
     _data_stream_url: str
     is_started: bool
 
-    def __init__(self, stream_path: str, access_token: str | None = None, content_type: str | None = None, connect_timeout: int | None = None) -> None:
+    def __init__(self, stream_path: str, access_token: str | None = None, content_type: str | None = None, connect_timeout: int | None = None, connect_api_url: str | None = None) -> None:
         """
         Initialize an asynchronous ZebraStream writer.
 
@@ -127,11 +132,14 @@ class AsyncWriter:
             access_token (str, optional): Access token for authorization.
             content_type (str, optional): Content-Type for the HTTP request.
             connect_timeout (int, optional): Server-side timeout in seconds for the connect operation.
+            connect_api_url (str, optional): Base URL for the ZebraStream Connect API.
+                If None, uses the default public ZebraStream cloud service.
         """
         self._stream_path = stream_path
         self._access_token = access_token
         self._content_type = content_type
         self._connect_timeout = connect_timeout
+        self._connect_api_url = connect_api_url or DEFAULT_ZEBRASTREAM_CONNECT_API_URL
         self._buffer = asyncio.Queue()
         self._write_failed = False
         self.is_started = False
@@ -141,7 +149,8 @@ class AsyncWriter:
             stream_path=self._stream_path,
             mode=self._CONNECT_MODE,
             access_token=self._access_token, 
-            connect_timeout=self._connect_timeout
+            connect_timeout=self._connect_timeout,
+            connect_api_url=self._connect_api_url
         )
     
     def _start_send(self) -> None:
@@ -280,6 +289,7 @@ class AsyncReader:
     _access_token: str | None
     _content_type: str | None
     _connect_timeout: int | None
+    _connect_api_url: str
     _block_size: int
     _buffer: bytearray
     _read_event: asyncio.Event
@@ -289,7 +299,7 @@ class AsyncReader:
     _eof: bool
     _exception: Exception | None
 
-    def __init__(self, stream_path: str, access_token: str | None = None, content_type: str | None = None, connect_timeout: int | None = None, block_size: int = 4096) -> None:
+    def __init__(self, stream_path: str, access_token: str | None = None, content_type: str | None = None, connect_timeout: int | None = None, block_size: int = 4096, connect_api_url: str | None = None) -> None:
         """
         Initialize an asynchronous ZebraStream reader.
 
@@ -302,11 +312,14 @@ class AsyncReader:
                 Smaller values (e.g., 1024) provide lower latency for real-time data like log lines.
                 Larger values (e.g., 32768) provide better throughput for bulk data transfers.
                 Default is 4096 bytes, which balances latency and throughput for most use cases.
+            connect_api_url (str, optional): Base URL for the ZebraStream Connect API.
+                If None, uses the default public ZebraStream cloud service.
         """
         self._stream_path = stream_path
         self._access_token = access_token
         self._content_type = content_type
         self._connect_timeout = connect_timeout
+        self._connect_api_url = connect_api_url or DEFAULT_ZEBRASTREAM_CONNECT_API_URL
         self._block_size = block_size
         self._buffer = bytearray()
         self._read_event = asyncio.Event()
@@ -319,7 +332,8 @@ class AsyncReader:
             stream_path=self._stream_path,
             mode=self._CONNECT_MODE,
             access_token=self._access_token, 
-            connect_timeout=self._connect_timeout
+            connect_timeout=self._connect_timeout,
+            connect_api_url=self._connect_api_url
         )
     
     def _start_download(self) -> None:
