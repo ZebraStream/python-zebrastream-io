@@ -70,8 +70,20 @@ async def _connect(stream_path: str, mode: str, access_token: str | None = None,
                 except asyncio.TimeoutError:
                     # Don't catch TimeoutError here - let it bubble up to the outer try/except
                     raise
+                except asyncio.CancelledError:
+                    # Respect cancellation - don't retry when task is cancelled
+                    logger.debug("Connection attempt cancelled")
+                    raise
+                except aiohttp.ClientResponseError as e:
+                    # Don't retry authentication errors - they won't succeed on retry
+                    if e.status in (401, 403):
+                        logger.error(f"Authentication failed with status {e.status}: {e}")
+                        raise
+                    # Retry other HTTP errors (5xx server errors, etc.)
+                    logger.warning("Connection attempt failed: %s", e)
+                    await asyncio.sleep(1)
                 except Exception as e:
-                    # Only retry on non-timeout exceptions (network errors, HTTP errors, etc.)
+                    # Retry on other exceptions (network errors, etc.)
                     logger.warning("Connection attempt failed: %s", e)
                     await asyncio.sleep(1)
     
@@ -119,8 +131,8 @@ class AsyncWriter:
     _connect_api_url: str
     _buffer: asyncio.Queue[bytes | None]
     _write_failed: bool
-    _upload_task: asyncio.Task[None]
-    _data_stream_url: str
+    _upload_task: asyncio.Task[None] | None
+    _data_stream_url: str | None
     is_started: bool
 
     def __init__(self, stream_path: str, access_token: str | None = None, content_type: str | None = None, connect_timeout: int | None = None, connect_api_url: str | None = None) -> None:
@@ -143,6 +155,10 @@ class AsyncWriter:
         self._buffer = asyncio.Queue()
         self._write_failed = False
         self.is_started = False
+        
+        # Initialize attributes that are set later in start()
+        self._upload_task: asyncio.Task[None] | None = None
+        self._data_stream_url: str | None = None
 
     async def _start_connect(self) -> None:
         self._data_stream_url = await _connect(
@@ -155,8 +171,8 @@ class AsyncWriter:
     
     def _start_send(self) -> None:
         """Start the upload task to send data to the ZebraStream Data API."""
-        assert hasattr(self, "_data_stream_url"), "Client is not connected"  # TODO: remove (expect correct handling)
-        assert not hasattr(self, "_upload_task"), "Upload task is already running"  # TODO: remove (expect correct handling)
+        assert self._data_stream_url is not None, "Client is not connected"  # TODO: remove (expect correct handling)
+        assert self._upload_task is None, "Upload task is already running"  # TODO: remove (expect correct handling)
         self._upload_task = asyncio.create_task(self._upload())
         # TODO: check upload task for errors before continuing
 
@@ -178,21 +194,23 @@ class AsyncWriter:
     async def stop(self) -> None:
         """
         Stop the writer and wait for the upload task to finish.
-
-        Raises:
-            RuntimeError: If the writer is not started.
+        
+        This method is idempotent and safe to call multiple times or even if
+        start() was never called or didn't complete successfully.
         """
         if not self.is_started:
-            raise RuntimeError("Writer is not started")
+            logger.debug("AsyncWriter.stop() called but writer not started")
+
         logger.debug("Stopping AsyncWriter")
         await self._buffer.put(None)
         # await self.flush()  # Ensure all data is processed --> blocks!
-        try:
-            await self._upload_task
-        except Exception as e:
-            if not self._write_failed:
-                logger.error("Upload task failed: %s", e)
-                raise e
+        if self._upload_task is not None:
+            try:
+                await self._upload_task
+            except Exception as e:
+                if not self._write_failed:
+                    logger.error("Upload task failed: %s", e)
+                    raise e
         self.is_started = False
         logger.debug("AsyncWriter stopped")
 
@@ -293,8 +311,8 @@ class AsyncReader:
     _block_size: int
     _buffer: bytearray
     _read_event: asyncio.Event
-    _download_task: asyncio.Task[None]
-    _data_stream_url: str
+    _download_task: asyncio.Task[None] | None
+    _data_stream_url: str | None
     is_started: bool
     _eof: bool
     _exception: Exception | None
@@ -326,6 +344,10 @@ class AsyncReader:
         self.is_started = False
         self._eof = False
         self._exception = None
+        
+        # Initialize attributes that are set later in start()
+        self._download_task: asyncio.Task[None] | None = None
+        self._data_stream_url: str | None = None
 
     async def _start_connect(self) -> None:
         self._data_stream_url = await _connect(
@@ -337,8 +359,8 @@ class AsyncReader:
         )
     
     def _start_download(self) -> None:
-        assert hasattr(self, "_data_stream_url"), "Client is not connected"  # TODO: remove (expect correct handling)
-        assert not hasattr(self, "_download_task"), "Download task is already running"  # TODO: remove (expect correct handling)
+        assert self._data_stream_url is not None, "Client is not connected"  # TODO: remove (expect correct handling)
+        assert self._download_task is None, "Download task is already running"  # TODO: remove (expect correct handling)
         self._download_task = asyncio.create_task(self._download())
 
     async def start(self) -> None:
@@ -359,14 +381,15 @@ class AsyncReader:
     async def stop(self) -> None:
         """
         Stop the reader and wait for the download task to finish.
-
-        Raises:
-            RuntimeError: If the reader is not started.
+        
+        This method is idempotent and safe to call multiple times or even if
+        start() was never called or didn't complete successfully.
         """
         if not self.is_started:
-            raise RuntimeError("Reader is not started")
+            logger.debug("AsyncReader.stop() called but reader not started")
+        
         logger.debug("Stopping AsyncReader")
-        if self._download_task:
+        if self._download_task is not None:
             self._download_task.cancel()
             try:
                 await self._download_task

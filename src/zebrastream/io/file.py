@@ -8,6 +8,7 @@ sync and async code, supporting context management and typical file operations.
 """
 
 import atexit
+import inspect
 import io
 import logging
 import os
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar('T')
 
 class _PortalManager:
-    """Manages anyio blocking portal lifecycle."""
+    """Manages anyio blocking portal lifecycle with cancellation support."""
     
     # Class-level type annotations - use WeakSet to avoid reference leaks
     _instances: weakref.WeakSet['_PortalManager'] = weakref.WeakSet()
@@ -34,28 +35,63 @@ class _PortalManager:
     
     _blocking_portal: Any  # FIX: AnyIO type
     _blocking_portal_cm: Any  # FIX: AnyIO type
+    _cancel_scope: anyio.CancelScope | None
+    _is_closed: bool
 
     def __init__(self) -> None:
         """Initialize and start the blocking portal."""
         logger.debug("Initializing PortalManager")
         
+        self._is_closed = False
+        self._cancel_scope = None
+        
         # Register for cleanup - WeakSet doesn't keep strong references
         with self._instances_lock:
             self._instances.add(self)
         
-        # If this succeeds, object is guaranteed to be fully initialized
-        self._open_blocking_portal()
+        try:
+            # If this succeeds, object is guaranteed to be fully initialized
+            self._open_blocking_portal()
+        except Exception:
+            self._is_closed = True
+            raise
 
     def _open_blocking_portal(self) -> None:
         """Start the anyio blocking portal."""
         self._blocking_portal = anyio.from_thread.start_blocking_portal("asyncio")
         self._blocking_portal_cm = self._blocking_portal.__enter__()
 
+
     def _close_blocking_portal(self) -> None:
         """Stop the anyio blocking portal."""
         self._blocking_portal.__exit__(None, None, None)
         del self._blocking_portal_cm
         del self._blocking_portal
+    
+    def close(self) -> None:
+        """
+        Close the portal and release resources (idempotent).
+        
+        This method is safe to call multiple times.
+        """
+        if self._is_closed:
+            return
+        
+        logger.debug("Closing PortalManager")
+        self._is_closed = True
+        
+        # Cancel any ongoing operations
+        if self._cancel_scope is not None:
+            try:
+                self._cancel_scope.cancel()
+            except Exception:
+                logger.exception("Error cancelling scope during close")
+        
+        # Close the portal
+        try:
+            self._close_blocking_portal()
+        except Exception:
+            logger.exception("Error closing blocking portal")
 
     @overload  
     def call(self, callable: Callable[..., Awaitable[T]], *args: Any, **kwargs: Any) -> T: ...
@@ -64,17 +100,58 @@ class _PortalManager:
     def call(self, callable: Callable[..., T], *args: Any, **kwargs: Any) -> T: ...
 
     def call(self, callable: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Run a callable in the blocking portal."""
-        return self._blocking_portal_cm.call(callable, *args, **kwargs)
+        """
+        Run a callable in the blocking portal with cancellation support.
+        
+        For async callables, wraps in a cancellation scope that can be triggered
+        by any exception from the calling thread (including KeyboardInterrupt).
+        
+        This provides proper cancellation semantics, ensuring async tasks are
+        cleaned up even when the sync side encounters errors.
+        
+        Args:
+            callable: Sync or async callable to run in the event loop
+            *args: Positional arguments for the callable
+            **kwargs: Keyword arguments for the callable
+            
+        Returns:
+            The return value of the callable
+            
+        Raises:
+            Any exception raised by the callable is propagated after cleanup
+        """
+        # Check if callable is async
+        if inspect.iscoroutinefunction(callable):
+            # Async callable - wrap in cancellation scope for proper cancellation
+            async def _with_cancellation() -> Any:
+                with anyio.CancelScope() as scope:
+                    self._cancel_scope = scope
+                    try:
+                        return await callable(*args, **kwargs)
+                    finally:
+                        self._cancel_scope = None
+            
+            try:
+                return self._blocking_portal_cm.call(_with_cancellation)
+            finally:
+                # Always cancel if scope still exists (means abnormal exit)
+                if self._cancel_scope is not None:
+                    logger.debug("Abnormal exit detected, cancelling async operation")
+                    try:
+                        # cancel() is thread-safe, can be called directly
+                        self._cancel_scope.cancel()
+                    except Exception:
+                        # Best effort - original exception will be raised
+                        logger.exception("Failed to cancel scope during cleanup")
+        else:
+            # Sync callable - run directly (no cancellation scope needed)
+            return self._blocking_portal_cm.call(callable, *args, **kwargs)
 
     def __del__(self) -> None:
         """Clean up portal when object is destroyed."""
         try:
             logger.debug("Cleaning up PortalManager in destructor")
-            self._close_blocking_portal()
-            
-            # No need to manually unregister - WeakSet handles it automatically
-                
+            self.close()
         except Exception:
             logger.exception("Error during PortalManager cleanup")
 
@@ -86,6 +163,7 @@ class _AsyncInstanceManager:
     portal: _PortalManager
     instance: AsyncReader | AsyncWriter
     _owns_portal: bool
+    _is_closed: bool
 
     def __init__(self, async_factory: Callable[[], AsyncReader | AsyncWriter], portal_manager: _PortalManager | None = None) -> None:
         """
@@ -97,6 +175,8 @@ class _AsyncInstanceManager:
         """
         logger.debug("Initializing AsyncInstanceManager")
         
+        self._is_closed = False
+        
         # Use provided portal or create new one
         if portal_manager is None:
             self.portal = _PortalManager()
@@ -105,28 +185,49 @@ class _AsyncInstanceManager:
             self.portal = portal_manager
             self._owns_portal = False
         
-        # If this succeeds, object is guaranteed to be fully initialized
-        self.instance = self.portal.call(async_factory)
-        self.portal.call(self.instance.start)
+        self.instance = None  # type: ignore[assignment]
+        
+        try:
+            # If this succeeds, object is guaranteed to be fully initialized
+            self.instance = self.portal.call(async_factory)
+            self.portal.call(self.instance.start)
+        except (KeyboardInterrupt, Exception):
+            # Clean up on any failure (including interrupt)
+            logger.debug("Initialization failed or interrupted, cleaning up")
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """
+        Close the manager and release resources (idempotent).
+        
+        This method is safe to call multiple times.
+        """
+        if self._is_closed:
+            return
+        
+        logger.debug("Closing AsyncInstanceManager")
+        self._is_closed = True
+        
+        # Stop instance if it was created (stop() is idempotent, safe to call anytime)
+        if self.instance is not None:
+            try:
+                self.portal.call(self.instance.stop)
+            except Exception:
+                logger.exception("Error stopping instance during cleanup")
+        
+        # Close portal if we own it
+        if self._owns_portal:
+            try:
+                self.portal.close()
+            except Exception:
+                logger.exception("Error closing portal during cleanup")
 
     def __del__(self) -> None:
         """Clean up async instance when object is destroyed."""
         try:
             logger.debug("Cleaning up AsyncInstanceManager in destructor")
-            
-            # Stop async instance
-            try:
-                self.portal.call(self.instance.stop)
-            except Exception:
-                logger.exception("Error stopping async instance")
-        
-            # Clean up owned portal
-            if self._owns_portal:
-                try:
-                    del self.portal
-                except Exception:
-                    logger.exception("Error cleaning up portal")
-                
+            self.close()
         except Exception:
             logger.exception("Error during AsyncInstanceManager cleanup")
 
@@ -144,7 +245,8 @@ def _cleanup_portal_instances() -> None:
         # Cleanup outside lock
         try:
             logger.debug(f"Emergency cleanup of {instance.__class__.__name__}")
-            del instance  # Triggers __del__() properly
+            # Explicitly call close() for cleanup (idempotent)
+            instance.close()
         except Exception:
             logger.exception("Error cleaning up instance during shutdown")
 
