@@ -16,12 +16,24 @@ import tempfile
 import threading
 import weakref
 from collections.abc import Awaitable, Callable
+from concurrent.futures import CancelledError
 from contextlib import contextmanager
 from typing import Any, BinaryIO, Generator, TextIO, TypeVar, overload
 
 import anyio
 
 from ._core import AsyncReader, AsyncWriter
+from ._exceptions import (
+    AuthenticationError,
+    ConnectionFailedError,
+    ConnectionTimeoutError,
+    DownloadError,
+    NotStartedError,
+    PeerDisconnectedError,
+    ProtocolError,
+    StreamClosedError,
+    UploadError,
+)
 
 logger = logging.getLogger(__name__)
 T = TypeVar('T')
@@ -94,12 +106,12 @@ class _PortalManager:
             logger.exception("Error closing blocking portal")
 
     @overload  
-    def call(self, callable: Callable[..., Awaitable[T]], *args: Any, **kwargs: Any) -> T: ...
+    def call(self, callable: Callable[..., Awaitable[T]], cancellable: bool, *args: Any, **kwargs: Any) -> T: ...
     
     @overload
-    def call(self, callable: Callable[..., T], *args: Any, **kwargs: Any) -> T: ...
+    def call(self, callable: Callable[..., T], cancellable: bool, *args: Any, **kwargs: Any) -> T: ...
 
-    def call(self, callable: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    def call(self, callable: Callable[..., Any], cancellable: bool, *args: Any, **kwargs: Any) -> Any:
         """
         Run a callable in the blocking portal with cancellation support.
         
@@ -111,6 +123,7 @@ class _PortalManager:
         
         Args:
             callable: Sync or async callable to run in the event loop
+            cancellable: Whether to make the call cancellable (if async)
             *args: Positional arguments for the callable
             **kwargs: Keyword arguments for the callable
             
@@ -120,8 +133,8 @@ class _PortalManager:
         Raises:
             Any exception raised by the callable is propagated after cleanup
         """
-        # Check if callable is async
-        if inspect.iscoroutinefunction(callable):
+        # Make cancellable if async
+        if cancellable and inspect.iscoroutinefunction(callable):
             # Async callable - wrap in cancellation scope for proper cancellation
             async def _with_cancellation() -> Any:
                 with anyio.CancelScope() as scope:
@@ -144,7 +157,7 @@ class _PortalManager:
                         # Best effort - original exception will be raised
                         logger.exception("Failed to cancel scope during cleanup")
         else:
-            # Sync callable - run directly (no cancellation scope needed)
+            # Run directly (no cancellation scope needed)
             return self._blocking_portal_cm.call(callable, *args, **kwargs)
 
     def __del__(self) -> None:
@@ -161,7 +174,7 @@ class _AsyncInstanceManager:
     
     # Instance-level type annotations
     portal: _PortalManager
-    instance: AsyncReader | AsyncWriter
+    instance: AsyncReader | AsyncWriter | None
     _owns_portal: bool
     _is_closed: bool
 
@@ -189,8 +202,14 @@ class _AsyncInstanceManager:
         
         try:
             # If this succeeds, object is guaranteed to be fully initialized
-            self.instance = self.portal.call(async_factory)
-            self.portal.call(self.instance.start)
+            self.instance = self.portal.call(
+                callable=async_factory,
+                cancellable=False,
+            )
+            self.portal.call(
+                callable=self.instance.start,
+                cancellable=True,
+            )
         except (KeyboardInterrupt, Exception):
             # Clean up on any failure (including interrupt)
             logger.debug("Initialization failed or interrupted, cleaning up")
@@ -212,9 +231,12 @@ class _AsyncInstanceManager:
         # Stop instance if it was created (stop() is idempotent, safe to call anytime)
         if self.instance is not None:
             try:
-                self.portal.call(self.instance.stop)
-            except Exception:
-                logger.exception("Error stopping instance during cleanup")
+                self.portal.call(
+                    callable=self.instance.stop,
+                    cancellable=False, # probalby slightly better choice, but True also works
+                )
+            finally:
+                self.instance = None
         
         # Close portal if we own it
         if self._owns_portal:
@@ -335,6 +357,8 @@ def open(mode: str, encoding: str = "utf-8", random_read: bool = False, download
 
     Raises:
         ValueError: If mode is not supported or random_read=True with write mode.
+        OSError: If connection fails or authentication fails.
+        TimeoutError: If connection times out.
     """
     logger.debug(f"Opening ZebraStream in mode '{mode}', random_read={random_read}")
     
@@ -343,31 +367,33 @@ def open(mode: str, encoding: str = "utf-8", random_read: bool = False, download
         logger.error("random_read=True only supported for read modes")
         raise ValueError("random_read=True only supported for read modes ('r', 'rt', 'rb')")
     
-    # Normalize mode
-    if mode in ("r", "rt"):
-        # Text read mode
-        binary_reader = Reader(**kwargs)
-        if random_read:
-            return _create_buffered_reader(binary_reader, encoding, download_chunk_size)
-        else:
+    try:
+        # Normalize mode
+        if mode in ("r", "rt"):
+            # Text read mode
+            binary_reader = Reader(**kwargs)
+            if random_read:
+                return _create_buffered_reader(binary_reader, encoding, download_chunk_size)
             return io.TextIOWrapper(binary_reader, encoding=encoding)
-    elif mode == "rb":
-        # Binary read mode
-        binary_reader = Reader(**kwargs)
-        if random_read:
-            return _create_buffered_reader(binary_reader, None, download_chunk_size)
-        else:
+        if mode == "rb":
+            # Binary read mode
+            binary_reader = Reader(**kwargs)
+            if random_read:
+                return _create_buffered_reader(binary_reader, None, download_chunk_size)
             return binary_reader
-    elif mode in ("w", "wt"):
-        # Text write mode
-        binary_writer = Writer(**kwargs)
-        return io.TextIOWrapper(binary_writer, encoding=encoding)
-    elif mode == "wb":
-        # Binary write mode
-        return Writer(**kwargs)
-    else:
+        if mode in ("w", "wt"):
+            # Text write mode
+            binary_writer = Writer(**kwargs)
+            return io.TextIOWrapper(binary_writer, encoding=encoding)
+        if mode == "wb":
+            # Binary write mode
+            return Writer(**kwargs)
         logger.error(f"Unsupported mode: {mode!r}")
         raise ValueError(f"Unsupported mode: {mode!r}. Supported: 'r', 'rt', 'rb', 'w', 'wt', 'wb'.")
+    except ConnectionTimeoutError as e:
+        raise TimeoutError(f"open failed: {e.message}") from e
+    except (ConnectionFailedError, AuthenticationError) as e:
+        raise OSError(f"open failed: {e.message}") from e
 
 
 class _BinaryIOBase(BinaryIO):
@@ -456,12 +482,40 @@ class Writer(_BinaryIOBase):
     def write(self, data: bytes) -> int:
         """
         Write bytes. Data may be buffered - use flush() for immediate transmission.
+        
+        Raises:
+            TypeError: If data is not bytes.
+            ValueError: If file is closed.
+            OSError: If stream not started or generic I/O failure.
+            BrokenPipeError: If peer disconnected during write.
+            TimeoutError: If write operation timed out.
         """
+        if not isinstance(data, bytes):
+            raise TypeError(f"a bytes-like object is required, not '{type(data).__name__}'")
+        
         if self._async_manager is None:
             raise ValueError("I/O operation on closed file")
             
         logger.debug(f"Writing {len(data)} bytes")
-        self._async_manager.portal.call(self._async_manager.instance.write, data)
+        try:
+            self._async_manager.portal.call(
+                callable=self._async_manager.instance.write,
+                cancellable=True,
+                data=data,
+            )
+        except StreamClosedError as e:
+            raise ValueError("I/O operation on closed file") from e
+        except NotStartedError as e:
+            raise OSError(f"write failed: stream not started") from e
+        except PeerDisconnectedError as e:
+            raise BrokenPipeError(f"write failed: peer disconnected") from e
+        except UploadError as e:
+            raise OSError(f"write failed: {e.message}") from e
+        except ConnectionTimeoutError as e:
+            raise TimeoutError(f"write failed: {e.message}") from e
+        except (ConnectionFailedError, AuthenticationError, ProtocolError) as e:
+            raise OSError(f"write failed: {e.message}") from e
+        
         return len(data)
     
     def readable(self) -> bool:
@@ -474,15 +528,62 @@ class Writer(_BinaryIOBase):
         return False  # General capability - never changes
     
     def flush(self) -> None:
-        """Flush buffered data for immediate transmission."""
+        """
+        Flush buffered data for immediate transmission.
+        
+        Raises:
+            ValueError: If file is closed.
+            OSError: If background upload has failed.
+            BrokenPipeError: If peer disconnected during upload.
+            TimeoutError: If background upload timed out.
+        """
         if self._async_manager is None:
             raise ValueError("I/O operation on closed file")
-        self._async_manager.portal.call(self._async_manager.instance.flush)
+        
+        try:
+            self._async_manager.portal.call(
+                callable=self._async_manager.instance.flush,
+                cancellable=True
+            )
+        except StreamClosedError as e:
+            raise ValueError("I/O operation on closed file") from e
+        except NotStartedError as e:
+            raise OSError("flush failed: stream not started") from e
+        except PeerDisconnectedError as e:
+            raise BrokenPipeError("flush failed: peer disconnected") from e
+        except UploadError as e:
+            raise OSError(f"flush failed: {e.message}") from e
+        except ConnectionTimeoutError as e:
+            raise TimeoutError(f"flush failed: {e.message}") from e
+        except (ConnectionFailedError, AuthenticationError, ProtocolError) as e:
+            raise OSError(f"flush failed: {e.message}") from e
     
     def close(self) -> None:
-        """Close the writer and release all resources."""
+        """
+        Close the writer and release all resources.
+        
+        Note: This method is more lenient than other methods.
+        State errors (already closed) are ignored. Only serious errors
+        (transfer failures, connection issues) may propagate as OSError.
+        
+        Raises:
+            OSError: If cleanup encounters serious errors.
+        """
         if self._async_manager is not None:
-            del self._async_manager  # Triggers immediate cleanup via __del__
+            try:
+                self._async_manager.close()
+            except (UploadError, DownloadError, ConnectionFailedError, AuthenticationError, ProtocolError) as e:
+                # Serious errors during cleanup should propagate
+                logger.error(f"Error during close: {e.message}")
+                raise OSError(f"close failed: {e.message}") from e
+            except (StreamClosedError, NotStartedError, PeerDisconnectedError):
+                # State errors and peer disconnects during cleanup are logged but not raised
+                # These are expected in various shutdown scenarios
+                pass
+            except Exception as e:
+                # Unexpected errors are logged but not raised to ensure cleanup completes
+                logger.warning(f"Unexpected error during close: {e}")
+                pass
             self._async_manager = None
     
     @property 
@@ -511,16 +612,45 @@ class Reader(_BinaryIOBase):
         raise io.UnsupportedOperation("not writable")
     
     def read(self, size: int = -1) -> bytes:
-        """Read bytes from the ZebraStream data stream."""
+        """
+        Read bytes from the ZebraStream data stream.
+        
+        Raises:
+            ValueError: If file is closed.
+            OSError: If stream not started or generic I/O failure.
+            BrokenPipeError: If peer disconnected during read.
+            TimeoutError: If read operation timed out.
+        """
         if self._async_manager is None:
             raise ValueError("I/O operation on closed file")
             
         logger.debug(f"Reading up to {size} bytes")
         if size == 0:
             return b""
-        if size < 0:
-            return self._async_manager.portal.call(self._async_manager.instance.read_all)
-        return self._async_manager.portal.call(self._async_manager.instance.read_variable_block, size)
+        
+        try:
+            if size < 0:
+                return self._async_manager.portal.call(
+                    callable=self._async_manager.instance.read_all,
+                    cancellable=True,
+                )
+            return self._async_manager.portal.call(
+                callable=self._async_manager.instance.read_variable_block,
+                cancellable=True,
+                n=size,
+            )
+        except StreamClosedError as e:
+            raise ValueError("I/O operation on closed file") from e
+        except NotStartedError as e:
+            raise OSError("read failed: stream not started") from e
+        except PeerDisconnectedError as e:
+            raise BrokenPipeError("read failed: peer disconnected") from e
+        except DownloadError as e:
+            raise OSError(f"read failed: {e.message}") from e
+        except ConnectionTimeoutError as e:
+            raise TimeoutError(f"read failed: {e.message}") from e
+        except (ConnectionFailedError, AuthenticationError, ProtocolError) as e:
+            raise OSError(f"read failed: {e.message}") from e
     
     def readable(self) -> bool:
         return True   # General capability - never changes
@@ -535,10 +665,33 @@ class Reader(_BinaryIOBase):
         pass  # No-op for readers
     
     def close(self) -> None:
-        """Close the reader and release all resources."""
+        """
+        Close the reader and release all resources.
+        
+        Note: This method is more lenient than other methods.
+        State errors (already closed) are ignored. Only serious errors
+        (transfer failures, connection issues) may propagate as OSError.
+        
+        Raises:
+            OSError: If cleanup encounters serious errors.
+        """
         if self._async_manager is not None:
-            del self._async_manager  # Triggers immediate cleanup via __del__
-            self._async_manager = None
+            try:
+                self._async_manager.close()
+            except (UploadError, DownloadError, ConnectionFailedError, AuthenticationError, ProtocolError) as e:
+                # Serious errors during cleanup should propagate
+                logger.error(f"Error during close: {e.message}")
+                raise OSError(f"close failed: {e.message}") from e
+            except (StreamClosedError, NotStartedError, PeerDisconnectedError):
+                # State errors and peer disconnects during cleanup are logged but not raised
+                # These are expected in various shutdown scenarios
+                pass
+            except Exception as e:
+                # Unexpected errors are logged but not raised to ensure cleanup completes
+                logger.warning(f"Unexpected error during close: {e}")
+                pass
+            finally:
+                self._async_manager = None
     
     @property
     def closed(self) -> bool:

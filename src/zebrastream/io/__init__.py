@@ -10,4 +10,6 @@ try:
 except PackageNotFoundError:
     __version__ = "unknown"
 
-__all__ = ["DEFAULT_ZEBRASTREAM_CONNECT_API_URL"]
+__all__ = [
+    "DEFAULT_ZEBRASTREAM_CONNECT_API_URL",
+]
