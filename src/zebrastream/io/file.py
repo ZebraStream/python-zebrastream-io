@@ -423,9 +423,11 @@ class _BinaryIOBase(BinaryIO):
         result = b""
         while True:
             char = self.read(1)
-            if not char or char == b'\n':
+            if not char:
                 break
             result += char
+            if char == b'\n':
+                break
             if size > 0 and len(result) >= size:
                 break
         return result
