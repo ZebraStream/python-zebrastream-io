@@ -11,7 +11,6 @@ over HTTP using the ZebraStream Connect API.
 # TODO: control queue capacity/size --> keep external for now (like StreamWriter)
 # TODO: use exponential backoff for connect procedure
 # TODO: add aiohttp TCP connect timeout?
-# TODO: signal premature disconnect as exception to user code
 
 import asyncio
 import logging
@@ -184,6 +183,11 @@ class AsyncWriter:
     is_started: bool
     _closed: bool
     _eof_sent: bool
+    
+    @property
+    def stream_path(self) -> str:
+        """Return the stream path identifier."""
+        return self._stream_path
 
     def __init__(self, stream_path: str, access_token: str | None = None, content_type: str | None = None, connect_timeout: int | None = None, connect_api_url: str | None = None) -> None:
         """
@@ -433,6 +437,11 @@ class AsyncReader:
     _eof_consumed: bool
     _exception: Exception | None
     _closed: bool
+    
+    @property
+    def stream_path(self) -> str:
+        """Return the stream path identifier."""
+        return self._stream_path
 
     def __init__(self, stream_path: str, access_token: str | None = None, content_type: str | None = None, connect_timeout: int | None = None, block_size: int = 4096, connect_api_url: str | None = None) -> None:
         """
