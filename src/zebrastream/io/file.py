@@ -402,6 +402,8 @@ def open(
             - access_token (str): Access token for authentication
             - content_type (str): Content type for the stream
             - connect_timeout (int): Connection timeout in seconds
+            - write_buffer_size (int): Optional write buffer size in bytes (default: 64 KiB). Only for write modes.
+            - transfer_buffer_multiplier (int): Transfer buffer size multiplier (default: 10). Only for write modes.
             - connect_api_url (str): ZebraStream Connect API URL
               (defaults to public cloud service)
 
@@ -419,13 +421,13 @@ def open(
                 for line in f:
                     print(line)
 
-        Binary write with immediate flush::
+        Binary write with immediate flush:
 
             with open(mode='wb', stream_path='/data') as f:
                 f.write(b'urgent data')
                 f.flush()  # Send immediately
 
-        Random access for pandas (requires 'with' statement)::
+        Random access for pandas (requires 'with' statement):
 
             with open(mode='rb', random_read=True, stream_path='/data.parquet') as f:
                 df = pd.read_parquet(f)
@@ -496,7 +498,7 @@ class Writer(io.BufferedIOBase):
         Initialize a synchronous Writer for ZebraStream.
 
         Args:
-            **kwargs: Arguments passed to the underlying AsyncWriter (e.g., stream_path, access_token, content_type, connect_timeout).
+            **kwargs: Arguments passed to the underlying AsyncWriter (e.g., stream_path, access_token, content_type, connect_timeout, write_buffer_size, transfer_buffer_multiplier).
         """
         super().__init__()
         self._async_manager = _AsyncInstanceManager(lambda: AsyncWriter(**kwargs))
@@ -573,7 +575,9 @@ class Writer(io.BufferedIOBase):
             raise ValueError("I/O operation on closed file")
 
         try:
-            self._async_manager.portal.call(callable=self._async_manager.instance.flush, cancellable=True)
+            self._async_manager.portal.call(
+                callable=self._async_manager.instance.flush, cancellable=True, wait_upload=True
+            )
         except StreamClosedError as e:
             raise ValueError("I/O operation on closed file") from e
         except NotStartedError as e:
@@ -617,7 +621,7 @@ class Writer(io.BufferedIOBase):
 
     @property
     def closed(self) -> bool:
-        """Required by BinaryIO interface."""
+        """Return True if the writer is closed."""
         return self._async_manager is None
 
     @property

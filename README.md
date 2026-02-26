@@ -26,10 +26,12 @@ The synchronous interface provides a familiar, file-like API for reading from an
 
 ```python
 import zebrastream.io.file as zsfile
+import time
 
 with zsfile.open(mode="w", stream_path="/my-stream", access_token=token) as f:
     f.write("Hello!")
-    f.flush() # force send buffer
+    f.flush()  # force send buffer
+    time.sleep(10)
     f.write("This is ZebraStream")
 ```
 
@@ -43,7 +45,34 @@ with zsfile.open(mode="r", stream_path="/my-stream", access_token=token) as f:
         print(line, end="")
 ```
 
-### Async interface (internal)
+### End-to-End Encryption
+
+> **⚠️ Experimental:** End-to-end encryption support is currently experimental and subject to change.
+
+ZebraStream supports passphrase-based end-to-end encryption using an encryption scheme derived from [age](https://age-encryption.org/), a simple and secure file encryption format. When encryption is enabled, data is encrypted on the sender side before transmission and can only be decrypted by receivers with the correct passphrase. Follow the general security descriptions of the age project.
+
+```python
+import zebrastream.io.file as zsfile
+import time
+
+# Producer - encrypt data before sending
+with zsfile.open(mode="w", stream_path="/my-stream", 
+                 access_token=token, 
+                 encryption_passphrase="secret") as f:
+    f.write("This is")
+    f.flush()
+    time.sleep(10)
+    f.write("encrypted data")
+
+# Consumer - decrypt data after receiving
+with zsfile.open(mode="r", stream_path="/my-stream", 
+                 access_token=token,
+                 decryption_passphrase="secret") as f:
+    for line in f:
+        print(line)
+```
+
+### Async interface (unstable)
 
 Async interface for performing network operations using the asyncio event loop.
 
@@ -61,6 +90,7 @@ async def main():
     async with AsyncWriter(stream_path="/my-stream", access_token=token) as writer:
         await writer.write(b"Hello!")
         await writer.flush()
+        await asyncio.sleep(10)
         await writer.write("This is ZebraStream")
 
 asyncio.run(main())

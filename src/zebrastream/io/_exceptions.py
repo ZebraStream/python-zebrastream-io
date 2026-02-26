@@ -20,13 +20,13 @@ if TYPE_CHECKING:
 
 class ZebraStreamError(Exception):
     """Base exception for all zebrastream errors.
-    
+
     Attributes:
         message: Human-readable error message
         stream_path: The stream path involved (if applicable)
         original_error: Wrapped underlying exception (if any)
     """
-    
+
     def __init__(
         self,
         message: str,
@@ -46,11 +46,11 @@ class ZebraStreamError(Exception):
 
 class ZebraStreamConnectionError(ZebraStreamError):
     """Base for connection establishment failures.
-    
+
     Additional Attributes:
         connect_api_url: The connect API URL used
     """
-    
+
     def __init__(
         self,
         message: str,
@@ -64,11 +64,11 @@ class ZebraStreamConnectionError(ZebraStreamError):
 
 class ConnectionTimeoutError(ZebraStreamConnectionError):
     """Connection attempt timed out.
-    
+
     Additional Attributes:
         timeout_seconds: The timeout value that was exceeded
     """
-    
+
     def __init__(
         self,
         timeout_seconds: float,
@@ -84,12 +84,12 @@ class ConnectionTimeoutError(ZebraStreamConnectionError):
 
 class ConnectionFailedError(ZebraStreamConnectionError):
     """Connection failed after all retries exhausted.
-    
+
     Additional Attributes:
         retries: Number of retry attempts made
         last_error: Last error that caused failure
     """
-    
+
     def __init__(
         self,
         retries: int,
@@ -106,11 +106,11 @@ class ConnectionFailedError(ZebraStreamConnectionError):
 
 class AuthenticationError(ZebraStreamConnectionError):
     """Authentication or authorization failed.
-    
+
     Additional Attributes:
         status_code: HTTP status code (401, 403)
     """
-    
+
     def __init__(
         self,
         status_code: int,
@@ -131,12 +131,12 @@ class AuthenticationError(ZebraStreamConnectionError):
 
 class ZebraStreamTransferError(ZebraStreamError):
     """Base for data transfer failures.
-    
+
     Additional Attributes:
         phase: "upload" or "download"
         bytes_transferred: Bytes successfully transferred before failure
     """
-    
+
     def __init__(
         self,
         message: str,
@@ -151,11 +151,11 @@ class ZebraStreamTransferError(ZebraStreamError):
 
 class PeerDisconnectedError(ZebraStreamTransferError):
     """Peer disconnected prematurely during transfer.
-    
+
     Additional Attributes:
         peer_role: "reader" or "writer" (who disconnected)
     """
-    
+
     def __init__(
         self,
         peer_role: str,
@@ -169,7 +169,7 @@ class PeerDisconnectedError(ZebraStreamTransferError):
 
 class UploadError(ZebraStreamTransferError):
     """Upload (PUT) operation failed."""
-    
+
     def __init__(
         self,
         message: str,
@@ -181,7 +181,7 @@ class UploadError(ZebraStreamTransferError):
 
 class DownloadError(ZebraStreamTransferError):
     """Download (GET) operation failed."""
-    
+
     def __init__(
         self,
         message: str,
@@ -193,12 +193,12 @@ class DownloadError(ZebraStreamTransferError):
 
 class ProtocolError(ZebraStreamTransferError):
     """Protocol violation (malformed control messages, unexpected responses).
-    
+
     Additional Attributes:
         expected: Expected message/state
         actual: Actual message/state received
     """
-    
+
     def __init__(
         self,
         message: str,
@@ -219,12 +219,12 @@ class ProtocolError(ZebraStreamTransferError):
 
 class ZebraStreamStateError(ZebraStreamError):
     """Base for lifecycle/state management errors.
-    
+
     Additional Attributes:
         current_state: Current state of the stream
         operation: Operation that was attempted
     """
-    
+
     def __init__(
         self,
         message: str,
@@ -239,22 +239,17 @@ class ZebraStreamStateError(ZebraStreamError):
 
 class AlreadyStartedError(ZebraStreamStateError):
     """Attempted to start an already-started stream."""
-    
+
     def __init__(
         self,
         **kwargs: Any,
     ):
-        super().__init__(
-            "Stream already started",
-            current_state="started",
-            operation="start",
-            **kwargs
-        )
+        super().__init__("Stream already started", current_state="started", operation="start", **kwargs)
 
 
 class NotStartedError(ZebraStreamStateError):
     """Attempted operation on a not-yet-started stream."""
-    
+
     def __init__(
         self,
         operation: str | None = None,
@@ -264,17 +259,12 @@ class NotStartedError(ZebraStreamStateError):
             message = f"Stream not started (attempted: {operation})"
         else:
             message = "Stream not started"
-        super().__init__(
-            message,
-            current_state="not_started",
-            operation=operation,
-            **kwargs
-        )
+        super().__init__(message, current_state="not_started", operation=operation, **kwargs)
 
 
 class StreamClosedError(ZebraStreamStateError):
     """Attempted operation on a closed stream."""
-    
+
     def __init__(
         self,
         operation: str | None = None,
@@ -284,10 +274,55 @@ class StreamClosedError(ZebraStreamStateError):
             message = f"Stream closed (attempted: {operation})"
         else:
             message = "Stream closed"
-        super().__init__(
-            message,
-            current_state="closed",
-            operation=operation,
-            **kwargs
-        )
+        super().__init__(message, current_state="closed", operation=operation, **kwargs)
 
+
+# ============================================================================
+# Encryption Exceptions
+# ============================================================================
+
+
+class EncryptionError(ZebraStreamError):
+    """Encryption operation failed.
+
+    Wraps age-rt encoding errors during upload.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        **kwargs: Any,
+    ):
+        super().__init__(message, **kwargs)
+
+
+class DecryptionError(ZebraStreamError):
+    """Decryption operation failed.
+
+    Wraps age-rt decoding errors during download.
+    This includes header parsing failures, truncation, and authentication failures.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        **kwargs: Any,
+    ):
+        super().__init__(message, **kwargs)
+
+
+class DataAuthenticationError(DecryptionError):
+    """Data authentication failed during decryption.
+
+    Raised when age-rt chunk authentication fails, typically indicating:
+    - Wrong decryption passphrase
+    - Tampered/corrupted ciphertext
+    - Protocol mismatch
+    """
+
+    def __init__(
+        self,
+        message: str,
+        **kwargs: Any,
+    ):
+        super().__init__(message, **kwargs)
