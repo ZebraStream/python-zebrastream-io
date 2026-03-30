@@ -58,7 +58,7 @@ import time
 # Producer - encrypt data before sending
 with zsfile.open(mode="w", stream_path="/my-stream", 
                  access_token=token, 
-                 encryption_passphrase="secret") as f:
+                 passphrase="secret") as f:
     f.write("This is")
     f.flush()
     time.sleep(10)
@@ -67,7 +67,7 @@ with zsfile.open(mode="w", stream_path="/my-stream",
 # Consumer - decrypt data after receiving
 with zsfile.open(mode="r", stream_path="/my-stream", 
                  access_token=token,
-                 decryption_passphrase="secret") as f:
+                 passphrase="secret") as f:
     for line in f:
         print(line)
 ```
@@ -108,6 +108,90 @@ async def main():
             print(data.decode(), end="")
 
 asyncio.run(main())
+```
+
+### Command-Line Interface
+
+A `zebrastream` CLI is included as an optional extra for streaming data between Unix pipelines and ZebraStream streams. The CLI serves as a **reference implementation** showcasing the Python SDK's capabilities, with a focus on **correctness and protocol compliance** rather than maximum performance.
+
+#### Installation
+
+```bash
+pip install zebrastream-io[cli]
+```
+
+#### Usage
+
+The CLI provides `write` and `read` subcommands with global options:
+
+```bash
+# Write from stdin
+echo "Hello ZebraStream" | zebrastream write -s /my-stream
+
+# Write from a producer command
+zebrastream write -s /my-stream -- pg_dump mydb
+zebrastream write --stream-path /my-stream -- sh -c "cat data.txt | gzip"
+
+# Read to stdout
+zebrastream read -s /my-stream > output.txt
+zebrastream read --stream-path /my-stream | tar -xz
+
+# Pipe into a consumer command
+zebrastream read -s /my-stream -- tar -xz
+zebrastream read -s /my-stream -- python process.py
+
+# Global options (--log-level, --config-name, --config-file) come before subcommand
+zebrastream --log-level info write -s /my-stream --connect-timeout 30 < data.bin
+zebrastream --config-name production read -s /my-stream | jq .
+
+# Stream path can come from config
+zebrastream --config-name production write < data.txt
+
+# Using explicit config file path
+zebrastream --config-file ~/my-zebrastream-config.yaml write -s /my-stream
+
+# Using environment variable for authentication
+ZEBRASTREAM_ACCESS_TOKEN='your_token_here' zebrastream write -s /my-stream < file.txt
+```
+
+**Configuration Files:** Named configuration files should use the `.yaml` extension and be stored in `~/.config/zebrastream/streams/` for reusable settings. You can also specify an explicit file path with `--config-file`. When both are provided, `--config-file` takes precedence.
+
+Config files must include a `mode` field (`read` or `write`) that matches the subcommand used — this prevents accidentally using a write config with `read` or vice versa. If `stream_path` is included, the `-s/--stream-path` CLI option can be omitted.
+
+```yaml
+# ~/.config/zebrastream/streams/my-feed.yaml
+# Use with: zebrastream --config-name my-feed read
+
+# Required: must match the subcommand (read or write)
+mode: read
+
+# Stream path (optional if provided on command line)
+stream_path: /userspace/project/my-stream
+
+# Access token — prefer ZEBRASTREAM_ACCESS_TOKEN env var to keep it out of the file
+access_token: YOUR_ACCESS_TOKEN
+
+# Passphrase for symmetric end-to-end encryption (optional)
+# Both sender and receiver must use the same passphrase
+# Prefer ZEBRASTREAM_PASSPHRASE env var
+# passphrase: your-secret-passphrase
+
+# Content-Type header (optional, write mode only)
+# content_type: application/octet-stream
+
+# Override connect API URL (optional, defaults to ZebraStream cloud)
+# connect_url: https://connect.zebrastream.io/v0/
+
+# Connection timeout in seconds (optional, default: no timeout)
+# connect_timeout: 30
+```
+
+For more details on configuration, authentication, and advanced options:
+
+```bash
+zebrastream --help
+zebrastream write --help
+zebrastream read --help
 ```
 
 ## Documentation

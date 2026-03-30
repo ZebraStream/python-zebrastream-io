@@ -201,7 +201,7 @@ class AsyncWriter:
     is_started: bool
     _closed: bool
     _eof_sent: bool
-    _encryption_passphrase: str | None
+    _passphrase: str | None
 
     @property
     def stream_path(self) -> str:
@@ -215,7 +215,7 @@ class AsyncWriter:
         content_type: str | None = None,
         connect_timeout: int | None = None,
         connect_api_url: str | None = None,
-        encryption_passphrase: str | None = None,
+        passphrase: str | None = None,
         write_buffer_size: int = 65536,
         transfer_buffer_multiplier: int = 10,
     ) -> None:
@@ -229,7 +229,7 @@ class AsyncWriter:
             connect_timeout (int, optional): Server-side timeout in seconds for the connect operation.
             connect_api_url (str, optional): Base URL for the ZebraStream Connect API.
                 If None, uses the default public ZebraStream cloud service.
-            encryption_passphrase (str, optional): Passphrase for age-rt encryption.
+            passphrase (str, optional): Passphrase for symmetric encryption.
                 If provided, all data written will be encrypted using age-rt.
                 If None (default), data is transmitted unencrypted.
             write_buffer_size (int, optional): Size threshold for automatic buffer flushing in bytes.
@@ -248,7 +248,7 @@ class AsyncWriter:
         self._content_type = content_type
         self._connect_timeout = connect_timeout
         self._connect_api_url = connect_api_url or DEFAULT_ZEBRASTREAM_CONNECT_API_URL
-        self._encryption_passphrase = encryption_passphrase
+        self._passphrase = passphrase
         if transfer_buffer_multiplier < 1:
             raise ValueError(f"transfer_buffer_multiplier must be >= 1, got {transfer_buffer_multiplier}")
         self.write_buffer_size = write_buffer_size
@@ -438,11 +438,11 @@ class AsyncWriter:
                 yield chunk
 
         # Wrap with encryption if passphrase provided
-        if self._encryption_passphrase:
+        if self._passphrase:
             try:
                 from ._age_rt import aiter_encode
 
-                data_chunks = aiter_encode(plaintext_chunks(), self._encryption_passphrase)
+                data_chunks = aiter_encode(plaintext_chunks(), self._passphrase)
             except AgeRTError as e:
                 raise EncryptionError(
                     message=f"Failed to initialize encryption: {e}",
@@ -556,7 +556,7 @@ class AsyncReader:
     _eof_consumed: bool
     _exception: Exception | None
     _closed: bool
-    _decryption_passphrase: str | None
+    _passphrase: str | None
 
     @property
     def stream_path(self) -> str:
@@ -571,7 +571,7 @@ class AsyncReader:
         connect_timeout: int | None = None,
         block_size: int = 4096,
         connect_api_url: str | None = None,
-        decryption_passphrase: str | None = None,
+        passphrase: str | None = None,
     ) -> None:
         """
         Initialize an asynchronous ZebraStream reader.
@@ -587,7 +587,7 @@ class AsyncReader:
                 Default is 4096 bytes, which balances latency and throughput for most use cases.
             connect_api_url (str, optional): Base URL for the ZebraStream Connect API.
                 If None, uses the default public ZebraStream cloud service.
-            decryption_passphrase (str, optional): Passphrase for age-rt decryption.
+            passphrase (str, optional): Passphrase for symmetric encryption.
                 If provided, all data read will be decrypted using age-rt.
                 If None (default), data is read unencrypted.
         """
@@ -596,7 +596,7 @@ class AsyncReader:
         self._content_type = content_type
         self._connect_timeout = connect_timeout
         self._connect_api_url = connect_api_url or DEFAULT_ZEBRASTREAM_CONNECT_API_URL
-        self._decryption_passphrase = decryption_passphrase
+        self._passphrase = passphrase
         self._block_size = block_size
         self._buffer = bytearray()
         self._read_event = asyncio.Event()
@@ -845,11 +845,11 @@ class AsyncReader:
                             yield chunk
 
                     # Wrap with decryption if passphrase provided
-                    if self._decryption_passphrase:
+                    if self._passphrase:
                         try:
                             from ._age_rt import aiter_decode_chunks
 
-                            plaintext_chunks = aiter_decode_chunks(data_chunks(), self._decryption_passphrase)
+                            plaintext_chunks = aiter_decode_chunks(data_chunks(), self._passphrase)
                         except AgeRTError as e:
                             raise DecryptionError(
                                 message=f"Failed to initialize decryption: {e}",
