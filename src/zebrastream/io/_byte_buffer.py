@@ -233,12 +233,19 @@ class AsyncByteBuffer:
         return result
 
     def close(self) -> None:
-        """Signal EOF (no more writes will occur).
+        """Signal EOF or force-close the buffer.
 
-        Wakes any readers waiting for data so they can handle EOF.
+        Wakes all waiters so they can handle the closed state:
+        - ``consume_available`` / ``_consume`` waiting for data
+        - ``drain`` waiting for the buffer to empty
+        - ``write`` waiting for buffer space (backpressure)
+
+        Safe to call multiple times.
         """
         self._closed = True
-        self._data_available.set()  # Wake waiting readers
+        self._data_available.set()   # wake waiting readers
+        self._buffer_empty.set()     # wake waiting drain() calls
+        self._space_available.set()  # wake waiting write() calls
 
     async def drain(self) -> None:
         """Wait until all data has been consumed (buffer is empty).

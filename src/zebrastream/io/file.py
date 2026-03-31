@@ -37,6 +37,7 @@ import inspect
 import io
 import logging
 import os
+import sys
 import tempfile
 import threading
 import weakref
@@ -185,8 +186,8 @@ class _PortalManager:
                         # cancel() is thread-safe, can be called directly
                         self._cancel_scope.cancel()
                     except Exception:
-                        # Best effort - original exception will be raised
-                        logger.exception("Failed to cancel scope during cleanup")
+                        # Best effort — original exception will be raised
+                        logger.debug("Failed to cancel scope during cleanup", exc_info=True)
         else:
             # Run directly (no cancellation scope needed)
             return self._blocking_portal_cm.call(callable, *args, **kwargs)
@@ -266,22 +267,56 @@ class _AsyncInstanceManager:
         logger.debug("Closing AsyncInstanceManager")
         self._is_closed = True
 
-        # Stop instance if it was created (stop() is idempotent, safe to call anytime)
-        if self.instance is not None:
-            try:
-                self.portal.call(
-                    callable=self.instance.stop,
-                    cancellable=False,  # probalby slightly better choice, but True also works
-                )
-            finally:
-                self.instance = None
+        try:
+            # Stop instance if it was created (stop() is idempotent, safe to call anytime)
+            if self.instance is not None:
+                try:
+                    self.portal.call(
+                        callable=self.instance.stop,
+                        cancellable=False,  # probalby slightly better choice, but True also works
+                    )
+                finally:
+                    self.instance = None
+        finally:
+            # Close portal if we own it — must always run, even if stop() raised,
+            # otherwise the background event loop thread never terminates.
+            if self._owns_portal:
+                try:
+                    self.portal.close()
+                except Exception:
+                    logger.exception("Error closing portal during cleanup")
 
-        # Close portal if we own it
-        if self._owns_portal:
-            try:
-                self.portal.close()
-            except Exception:
-                logger.exception("Error closing portal during cleanup")
+    def abort(self) -> None:
+        """
+        Abort the managed writer without sending EOF (idempotent).
+
+        Forwards to :meth:`AsyncWriter.abort` so the upload task is cancelled
+        in-flight.  Falls back to a plain :meth:`close` if the underlying
+        instance has no ``abort`` method (e.g. it is an :class:`AsyncReader`).
+        """
+        if self._is_closed:
+            return
+
+        logger.debug("Aborting AsyncInstanceManager")
+        self._is_closed = True
+
+        try:
+            if self.instance is not None:
+                try:
+                    abort_fn = getattr(self.instance, "abort", None)
+                    if abort_fn is not None:
+                        self.portal.call(callable=abort_fn, cancellable=False)
+                    else:
+                        self.portal.call(callable=self.instance.stop, cancellable=False)
+                finally:
+                    self.instance = None
+        finally:
+            # Close portal if we own it — must always run, even if abort raised.
+            if self._owns_portal:
+                try:
+                    self.portal.close()
+                except Exception:
+                    logger.exception("Error closing portal during abort cleanup")
 
     def __del__(self) -> None:
         """Clean up async instance when object is destroyed."""
@@ -606,8 +641,10 @@ class Writer(io.BufferedIOBase):
             try:
                 self._async_manager.close()
             except (UploadError, DownloadError, ConnectionFailedError, AuthenticationError, ProtocolError) as e:
-                # Serious errors during cleanup should propagate
-                logger.error(f"Error during close: {e.message}")
+                # Serious errors during cleanup should propagate.
+                # Log at DEBUG only — the raised OSError carries the message to the caller,
+                # so logging at ERROR here would duplicate whatever the caller logs.
+                logger.debug(f"Error during close: {e.message}")
                 raise OSError(f"close failed: {e.message}") from e
             except (StreamClosedError, NotStartedError, PeerDisconnectedError):
                 # State errors and peer disconnects during cleanup are logged but not raised
@@ -618,6 +655,36 @@ class Writer(io.BufferedIOBase):
                 logger.warning(f"Unexpected error during close: {e}")
                 pass
             self._async_manager = None
+
+    def _abort(self) -> None:
+        """
+        Abort the writer without sending EOF.
+
+        Cancels the in-flight upload so the relay sees an incomplete stream
+        rather than a clean finish.  Called by :meth:`__exit__` when an
+        exception is propagating.
+        """
+        if self._async_manager is not None:
+            try:
+                self._async_manager.abort()
+            except Exception:
+                logger.warning("Error during writer abort", exc_info=True)
+            finally:
+                self._async_manager = None
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> None:
+        """
+        Exit the context manager.
+
+        Calls :meth:`_abort` if an exception is propagating so the consumer
+        receives an incomplete upload (error) instead of a clean EOF that
+        would falsely indicate success.  Otherwise falls through to
+        :meth:`close` for a clean finish.
+        """
+        if exc_type is not None:
+            self._abort()
+        else:
+            self.close()
 
     @property
     def closed(self) -> bool:
@@ -794,8 +861,10 @@ class Reader(io.BufferedIOBase):
             try:
                 self._async_manager.close()
             except (UploadError, DownloadError, ConnectionFailedError, AuthenticationError, ProtocolError) as e:
-                # Serious errors during cleanup should propagate
-                logger.error(f"Error during close: {e.message}")
+                # Serious errors during cleanup should propagate.
+                # Log at DEBUG only — the raised OSError carries the message to the caller,
+                # so logging at ERROR here would duplicate whatever the caller logs.
+                logger.debug(f"Error during close: {e.message}")
                 raise OSError(f"close failed: {e.message}") from e
             except (StreamClosedError, NotStartedError, PeerDisconnectedError):
                 # State errors and peer disconnects during cleanup are logged but not raised
@@ -805,6 +874,35 @@ class Reader(io.BufferedIOBase):
                 # Unexpected errors are logged but not raised to ensure cleanup completes
                 logger.warning(f"Unexpected error during close: {e}")
                 pass
+            finally:
+                self._async_manager = None
+
+    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> None:
+        """
+        Exit the context manager.
+
+        Calls :meth:`_abort` if an exception is propagating so cleanup is fast
+        and the original exception (:class:`KeyboardInterrupt`, etc.) reaches
+        the caller intact.  On a clean exit, calls :meth:`close` for normal
+        protocol validation.
+        """
+        if exc_type is not None:
+            self._abort()
+        else:
+            self.close()
+
+    def _abort(self) -> None:
+        """
+        Abort the reader without protocol validation.
+
+        Cancels the in-flight download task immediately.  Called by
+        :meth:`__exit__` when an exception is already propagating.
+        """
+        if self._async_manager is not None:
+            try:
+                self._async_manager.abort()
+            except Exception:
+                logger.warning("Error during reader abort", exc_info=True)
             finally:
                 self._async_manager = None
 

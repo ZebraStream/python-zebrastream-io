@@ -7,7 +7,6 @@ over HTTP using the ZebraStream Connect API.
 
 # TODO: an asyncio.StreamWriter-compatible wrapper class for AsyncZebraStreamWriter
 # TODO: an anyio.ByteStream-compatible wrapper class for AsyncZebraStreamWriter
-# TODO: control queue capacity/size --> keep external for now (like StreamWriter)
 # TODO: use exponential backoff for connect procedure
 # TODO: add aiohttp TCP connect timeout?
 
@@ -342,6 +341,37 @@ class AsyncWriter:
         self._closed = True
         logger.debug("AsyncWriter stopped")
 
+    async def abort(self) -> None:
+        """
+        Abort the writer immediately without sending EOF.
+
+        Cancels the upload task in-flight so the HTTP PUT body terminates
+        without a final chunk. The relay will see an incomplete upload and
+        should signal an error to any waiting consumer.
+
+        Call this instead of :meth:`stop` when the producer has failed and
+        sending a clean EOF would be misleading to the consumer.
+
+        This method is idempotent and safe to call multiple times or even if
+        start() was never called.
+        """
+        if self._closed:
+            logger.debug("AsyncWriter.abort() called but already closed")
+            return
+
+        logger.debug("Aborting AsyncWriter (no EOF will be sent)")
+
+        if self._upload_task is not None:
+            self._upload_task.cancel()
+            try:
+                await self._upload_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        self.is_started = False
+        self._closed = True
+        logger.debug("AsyncWriter aborted")
+
     async def write(self, data: bytes | None) -> None:
         """
         Write bytes to the ZebraStream data stream asynchronously.
@@ -420,7 +450,17 @@ class AsyncWriter:
         """Internal: Move write buffer to transfer buffer."""
         if not self._write_buffer:
             return
-        await self._transfer_buffer.write(bytes(self._write_buffer))
+        try:
+            await self._transfer_buffer.write(bytes(self._write_buffer))
+        except ValueError:
+            # Transfer buffer was force-closed (upload task died mid-write).
+            # Re-raise the real upload error if available, otherwise re-raise ValueError.
+            if self._upload_task is not None and self._upload_task.done() and not self._upload_task.cancelled():
+                exc = self._upload_task.exception()
+                if exc is not None:
+                    self._write_failed = True
+                    raise exc
+            raise
         self._write_buffer.clear()
 
     async def _drain(self) -> None:
@@ -513,6 +553,10 @@ class AsyncWriter:
                 stream_path=self._stream_path,
                 original_error=e,
             ) from e
+        finally:
+            # Closing the transfer buffer unblocks any concurrent _flush() / _drain()
+            # calls waiting for buffer space or drain completion. This is idempotent.
+            self._transfer_buffer.close()
 
     async def __aenter__(self) -> "AsyncWriter":
         """
@@ -526,9 +570,16 @@ class AsyncWriter:
 
     async def __aexit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> None:
         """
-        Exit the async context manager, stopping the writer.
+        Exit the async context manager.
+
+        Calls :meth:`abort` if an exception is in flight (so the consumer
+        receives an incomplete upload rather than a clean EOF), otherwise calls
+        :meth:`stop` for a clean finish.
         """
-        await self.stop()
+        if exc_type is not None:
+            await self.abort()
+        else:
+            await self.stop()
 
 
 class AsyncReader:
@@ -683,9 +734,8 @@ class AsyncReader:
             try:
                 await self._download_task
             except asyncio.CancelledError:
-                pass  # Expected during forced shutdown
+                pass
             except Exception as e:
-                # Unexpected exception from download task
                 logger.warning("Download task raised exception during cancellation: %s", e)
 
         self.is_started = False
@@ -859,10 +909,21 @@ class AsyncReader:
                     else:
                         plaintext_chunks = data_chunks()
 
-                    # Consume all plaintext chunks
-                    async for chunk in plaintext_chunks:
-                        self._buffer.extend(chunk)
-                        self._read_event.set()
+                    # Consume all plaintext chunks.
+                    # On cancellation, abort the transport before the CancelledError
+                    # propagates through resp.__aexit__ / session.__aexit__.
+                    # Without this, aiohttp calls transport.close() (graceful SSL
+                    # shutdown) on the live connection, which waits for the peer to
+                    # acknowledge the close_notify — causing the event-loop thread to
+                    # hang when the relay is still alive.
+                    try:
+                        async for chunk in plaintext_chunks:
+                            self._buffer.extend(chunk)
+                            self._read_event.set()
+                    except asyncio.CancelledError:
+                        if resp.connection is not None and resp.connection.protocol is not None:
+                            resp.connection.protocol.abort()
+                        raise
 
                     # Mark EOF and wake any waiting readers
                     self._eof = True
@@ -874,21 +935,23 @@ class AsyncReader:
             raise
         except AgeRTError as e:
             # Wrap age-rt decryption errors
-            logger.error("Decryption failed: %s", e)
+            # Log at DEBUG — the exception is stored in self._exception and will be
+            # re-raised at the read site, where the caller (e.g. CLI) logs at ERROR.
+            logger.debug("Decryption failed: %s", e)
             self._exception = DecryptionError(
                 message=f"Decryption failed: {e}",
                 stream_path=self._stream_path,
                 original_error=e,
             )
         except aiohttp.ClientError as e:
-            logger.error("Download failed: %s", e)
+            logger.debug("Download failed: %s", e)
             self._exception = DownloadError(
                 message=f"Download failed: {e}",
                 stream_path=self._stream_path,
                 original_error=e,
             )
         except Exception as e:
-            logger.error("Download failed unexpectedly: %s", e)
+            logger.debug("Download failed unexpectedly: %s", e)
             self._exception = DownloadError(
                 message=f"Download failed unexpectedly: {e}",
                 stream_path=self._stream_path,
@@ -908,8 +971,57 @@ class AsyncReader:
         await self.start()
         return self
 
+    async def abort(self) -> None:
+        """
+        Abort the reader immediately without protocol validation.
+
+        Cancels the download task in-flight and returns without waiting for it
+        to finish.  The subsequent portal shutdown (via
+        :meth:`_AsyncInstanceManager.abort`) will stop the event loop and let
+        anyio cancel any remaining tasks as part of its normal teardown.
+
+        Call this instead of :meth:`stop` when an exception is already
+        propagating (e.g. :class:`KeyboardInterrupt`) and a fast exit is
+        required.  Skips ``eof_received`` / ``eof_consumed`` validation.
+
+        This method is idempotent and safe to call multiple times.
+        """
+        if self._closed:
+            logger.debug("AsyncReader.abort() called but already closed")
+            return
+
+        logger.debug("Aborting AsyncReader (no validation)")
+
+        if self._download_task is not None:
+            self._download_task.cancel()
+            # Do not await — portal teardown cancels and joins remaining tasks.
+            # Register callback to suppress 'Future exception was never retrieved'.
+            self._download_task.add_done_callback(
+                lambda t: t.exception() if not t.cancelled() else None
+            )
+
+        # Unblock any portal.call(read_*) task currently waiting on _read_event
+        # inside the BlockingPortal task group.  portal.stop(cancel_remaining=False)
+        # does not cancel that group, so without this the event-loop thread hangs
+        # indefinitely in BlockingPortal.__aexit__.
+        if self._exception is None:
+            self._exception = StreamClosedError(
+                operation="read", stream_path=self._stream_path
+            )
+        self._read_event.set()
+
+        self.is_started = False
+        self._closed = True
+        logger.debug("AsyncReader aborted")
+
     async def __aexit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> None:
         """
-        Exit the async context manager, stopping the reader.
+        Exit the async context manager.
+
+        Calls :meth:`abort` if an exception is in flight so cleanup is fast,
+        otherwise calls :meth:`stop` for clean protocol validation.
         """
-        await self.stop()
+        if exc_type is not None:
+            await self.abort()
+        else:
+            await self.stop()
