@@ -7,12 +7,11 @@ over HTTP using the ZebraStream Connect API.
 
 # TODO: an asyncio.StreamWriter-compatible wrapper class for AsyncZebraStreamWriter
 # TODO: an anyio.ByteStream-compatible wrapper class for AsyncZebraStreamWriter
-# TODO: use exponential backoff for connect procedure
-# TODO: add aiohttp TCP connect timeout?
 
 import asyncio
 import logging
 import typing
+from enum import Enum
 
 import aiohttp
 
@@ -41,6 +40,48 @@ DEFAULT_ZEBRASTREAM_CONNECT_API_URL = "https://connect.zebrastream.io/v0/"
 # age encryption chunk size (64 KiB)
 # The original age format uses fixed 64 KiB chunks for optimal encryption performance
 AGE_CHUNK_SIZE = 64 * 1024  # 65536 bytes
+
+
+class _ErrorAction(Enum):
+    """Actions to take when handling connection errors."""
+    RAISE = 1        # Raise immediately (non-retryable error)
+    WRAP_AUTH = 2    # Wrap as AuthenticationError and raise
+    RETRY = 3        # Retry with backoff (transient error)
+
+
+def _categorize_error(e: Exception, had_stable_connection: bool) -> _ErrorAction:
+    """
+    Categorize connection error and determine action to take.
+    
+    Args:
+        e: The exception that was raised
+        had_stable_connection: Whether we've had a stable connection before
+        
+    Returns:
+        ErrorAction indicating how to handle the error
+    """
+    # Always raise these - non-retryable by nature
+    if isinstance(e, (asyncio.TimeoutError, asyncio.CancelledError)):
+        return _ErrorAction.RAISE
+    
+    # Authentication errors - wrap and raise (never retry)
+    if isinstance(e, aiohttp.ClientResponseError) and e.status in (401, 403):
+        return _ErrorAction.WRAP_AUTH
+    
+    # Client errors (4xx) - always raise (configuration problem)
+    if isinstance(e, aiohttp.ClientResponseError) and 400 <= e.status < 500:
+        return _ErrorAction.RAISE
+    
+    # Server errors (5xx) - retry only if we had a stable connection before
+    if isinstance(e, aiohttp.ClientResponseError) and e.status >= 500:
+        return _ErrorAction.RETRY if had_stable_connection else _ErrorAction.RAISE
+    
+    # Transient network errors - retry only if we had a stable connection before
+    if isinstance(e, (aiohttp.ClientOSError, aiohttp.ServerConnectionError, aiohttp.ServerTimeoutError)):
+        return _ErrorAction.RETRY if had_stable_connection else _ErrorAction.RAISE
+    
+    # Everything else (DNS, SSL, URL parsing, etc.) - always raise (configuration problem)
+    return _ErrorAction.RAISE
 
 
 async def _connect(
@@ -80,61 +121,113 @@ async def _connect(
         headers["Authorization"] = f"Bearer {access_token}"
     params = {"mode": mode}
     if connect_timeout is not None:
+        # we set the server-side timeout to be slightly longer than the client-side timeout to ensure the client-side timeout triggers first
         params["timeout"] = str(
             connect_timeout + 1
-        )  # we prefer the client-side timeout to fire instead of the server-side timeout
+        )
 
-    client_timeout = None
+    # Always set explicit connection timeout for fast failure on DNS/network errors
+    # Apply timeout per-request rather than per-session to avoid cleanup delays
+    TCP_CONNECT_TIMEOUT = 10  # seconds - fail fast on DNS/connection errors
+    
+    # Build timeout for individual requests
     if connect_timeout is not None:
-        client_timeout = aiohttp.ClientTimeout(total=connect_timeout)
+        request_timeout = aiohttp.ClientTimeout(
+            total=connect_timeout,
+            sock_connect=TCP_CONNECT_TIMEOUT,
+        )
+    else:
+        # No overall timeout, but still enforce connection timeout for fail-fast behavior
+        request_timeout = aiohttp.ClientTimeout(sock_connect=TCP_CONNECT_TIMEOUT)
+
+    # Retry strategy constants
+    MIN_STABLE_DURATION = 30  # seconds - connection must last this long to be considered stable
+    MAX_FAILURE_DURATION = 1800  # seconds - 30 minutes cumulative backoff before giving up
 
     retry_count = 0
+    cumulative_backoff = 0
+    had_stable_connection = False
     last_error: Exception | None = None
 
     async def _connect_attempt_loop() -> str:
-        nonlocal retry_count, last_error
-        async with aiohttp.ClientSession(timeout=client_timeout) as session:
+        nonlocal retry_count, cumulative_backoff, had_stable_connection, last_error
+        # Create session without default timeout - apply timeout per-request instead
+        async with aiohttp.ClientSession() as session:
             while True:
+                request_start_time = asyncio.get_event_loop().time()
+                
                 try:
-                    async with session.get(connect_url, params=params, headers=headers) as resp:
+                    async with session.get(
+                        connect_url, params=params, headers=headers, timeout=request_timeout
+                    ) as resp:
                         resp.raise_for_status()
                         data_stream_url = (await resp.text()).strip()
+                        
+                        # Reset counters after stable connection
+                        request_duration = asyncio.get_event_loop().time() - request_start_time
+                        if request_duration >= MIN_STABLE_DURATION:
+                            retry_count = 0
+                            cumulative_backoff = 0
+                            had_stable_connection = True
+                            logger.debug("Stable connection established, reset retry counters")
+                        
                         return data_stream_url
-                except asyncio.TimeoutError:
-                    # Don't catch TimeoutError here - let it bubble up to the outer try/except
-                    raise
-                except asyncio.CancelledError:
-                    # Respect cancellation - don't retry when task is cancelled
-                    logger.debug("Connection attempt cancelled")
-                    raise
-                except aiohttp.ClientResponseError as e:
-                    # Don't retry authentication errors - they won't succeed on retry
-                    if e.status in (401, 403):
-                        logger.error(f"Authentication failed with status {e.status}: {e}")
-                        raise AuthenticationError(
-                            status_code=e.status,
-                            stream_path=stream_path,
-                            connect_api_url=connect_api_url,
-                            original_error=e,
-                        ) from e
-                    # Retry other HTTP errors (5xx server errors, etc.)
-                    retry_count += 1
-                    last_error = e
-                    logger.warning("Connection attempt %d failed: %s", retry_count, e)
-                    await asyncio.sleep(1)
+                        
                 except Exception as e:
-                    # Retry on other exceptions (network errors, etc.)
-                    retry_count += 1
-                    last_error = e
-                    logger.warning("Connection attempt %d failed: %s", retry_count, e)
-                    await asyncio.sleep(1)
+                    # Categorize the error and determine action
+                    action = _categorize_error(e, had_stable_connection)
+                    
+                    match action:
+                        case _ErrorAction.RAISE:
+                            # Non-retryable error - log and raise immediately
+                            if not had_stable_connection:
+                                logger.debug(f"Initial connection attempt failed: {e}")
+                            else:
+                                logger.debug(f"Non-retryable connection error: {e}")
+                            raise
+                        
+                        case _ErrorAction.WRAP_AUTH:
+                            # Authentication error - wrap and raise
+                            logger.debug(f"Authentication failed: {e}")
+                            if isinstance(e, aiohttp.ClientResponseError):
+                                raise AuthenticationError(
+                                    status_code=e.status,
+                                    stream_path=stream_path,
+                                    connect_api_url=connect_api_url,
+                                    original_error=e,
+                                ) from e
+                            raise  # Shouldn't happen, but handle gracefully
+                        
+                        case _ErrorAction.RETRY:
+                            # Transient error - retry with linear backoff
+                            retry_count += 1
+                            backoff = retry_count  # Linear backoff: 1s, 2s, 3s, ...
+                            cumulative_backoff += backoff
+                            
+                            if cumulative_backoff > MAX_FAILURE_DURATION:
+                                logger.error(
+                                    "Maximum failure duration exceeded (%d seconds), giving up after %d retries",
+                                    MAX_FAILURE_DURATION,
+                                    retry_count,
+                                )
+                                raise
+                            
+                            last_error = e
+                            logger.warning(
+                                "Connection attempt %d failed: %s, retrying in %ds (cumulative: %ds)",
+                                retry_count,
+                                e,
+                                backoff,
+                                cumulative_backoff,
+                            )
+                            await asyncio.sleep(backoff)
 
     try:
         if connect_timeout is None:
             return await _connect_attempt_loop()
         return await asyncio.wait_for(_connect_attempt_loop(), timeout=connect_timeout)
     except asyncio.TimeoutError as e:
-        logger.error("Connection attempt timed out after %s seconds", connect_timeout)
+        logger.debug("Connection attempt timed out after %s seconds", connect_timeout)
         raise ConnectionTimeoutError(
             timeout_seconds=connect_timeout or 0,
             stream_path=stream_path,
@@ -149,7 +242,7 @@ async def _connect(
         raise
     except Exception as e:
         # Wrap any other exception as ConnectionFailedError
-        logger.error("Connection failed after %d attempts", retry_count)
+        logger.debug("Connection failed after %d attempts", retry_count)
         raise ConnectionFailedError(
             retries=retry_count,
             last_error=last_error or e,
@@ -335,7 +428,7 @@ class AsyncWriter:
                 pass  # Expected during forced shutdown
             except Exception as e:
                 if not self._write_failed:
-                    logger.error("Upload task failed: %s", e)
+                    logger.debug("Upload task failed: %s", e)
                     raise e
         self.is_started = False
         self._closed = True

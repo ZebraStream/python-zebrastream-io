@@ -256,17 +256,27 @@ def global_options(
         typer.Option("--config-file", help="Explicit path to a config file (takes precedence over --config-name)"),
     ] = None,
     log_level: Annotated[
-        str,
+        Optional[str],
         typer.Option("--log-level", help="Log level: error, warn, info, debug"),
-    ] = "error",
+    ] = None,
 ) -> None:
     """Global options for all zebrastream commands."""
-    setup_logging(log_level)
+    # Resolve log_level: CLI > config > default
+    resolved_log_level = log_level
+    if resolved_log_level is None and (config_name or config_file):
+        # Load config early to get log_level setting
+        config = load_config(config_name, config_file)
+        resolved_log_level = config.get("log_level")
+    if resolved_log_level is None:
+        resolved_log_level = "error"
+    
+    setup_logging(resolved_log_level)
     ctx.obj = GlobalOptions(
         config_name=config_name,
         config_file=config_file,
-        log_level=log_level,
+        log_level=resolved_log_level,
     )
+    # Show help if invoked without a subcommand
     if ctx.invoked_subcommand is None:
         typer.echo(ctx.get_help())
         raise typer.Exit()
