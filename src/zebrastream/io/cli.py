@@ -7,6 +7,7 @@ binary data between Unix pipelines and ZebraStream streams.
 """
 
 import logging
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -286,7 +287,7 @@ def prepare_stream_kwargs(
     args: StreamArgs,
     global_opts: GlobalOptions,
     mode: StreamMode,
-) -> tuple[str, dict]:
+) -> tuple[str, dict, Optional[list[str]]]:
     """Prepare kwargs for SDK stream open call.
     
     Args:
@@ -295,7 +296,7 @@ def prepare_stream_kwargs(
         mode: The subcommand being run (read or write)
         
     Returns:
-        Tuple of (resolved_stream_path, kwargs_dict) for zsfile.open()
+        Tuple of (resolved_stream_path, kwargs_dict, command_from_config) for zsfile.open()
     """
     # Load configuration (config_file takes precedence over config_name)
     config = load_config(global_opts.config_name, global_opts.config_file)
@@ -362,7 +363,44 @@ def prepare_stream_kwargs(
     if value := (args.content_type or config.get("content_type")):
         kwargs["content_type"] = value
     
-    return resolved_stream_path, kwargs
+    # Extract command from config if present (string format only)
+    config_command = None
+    if "command" in config:
+        cmd_value = config["command"]
+        if isinstance(cmd_value, str):
+            # Parse as shell command
+            config_command = shlex.split(cmd_value)
+        else:
+            logger.error(f"Config 'command' must be a string, got {type(cmd_value).__name__}")
+            sys.exit(EXIT_USAGE_ERROR)
+    
+    return resolved_stream_path, kwargs, config_command
+
+
+def resolve_command(
+    cli_cmd: list[str],
+    config_cmd: Optional[list[str]],
+    mode: str,
+) -> list[str]:
+    """Resolve final command from CLI and config, with precedence.
+    
+    Args:
+        cli_cmd: Command from CLI arguments (empty list if not provided)
+        config_cmd: Command from config file (None if not provided)
+        mode: "producer" or "consumer" (for logging)
+        
+    Returns:
+        Final command to execute (empty list means stdin/stdout mode)
+    """
+    if cli_cmd:
+        logger.debug(f"Using CLI {mode} command: {cli_cmd}")
+        return cli_cmd
+    elif config_cmd:
+        logger.debug(f"Using config {mode} command: {config_cmd}")
+        return config_cmd
+    else:
+        logger.debug(f"No {mode} command, using {'stdin' if mode == 'producer' else 'stdout'}")
+        return []
 
 
 def stream_stdin_to_writer(writer) -> None:
@@ -470,13 +508,15 @@ def write(
         producer_cmd = []
     
     # Prepare SDK kwargs using global options (resolves stream_path from config if needed)
-    resolved_stream_path, kwargs = prepare_stream_kwargs(
+    resolved_stream_path, kwargs, config_command = prepare_stream_kwargs(
         StreamArgs(stream_path, connect_url, connect_timeout, access_token, passphrase, content_type),
         global_opts,
         StreamMode.WRITE,
     )
-
-    logger.debug(f"Stream path: {resolved_stream_path}, Producer command: {producer_cmd}")
+    
+    # Resolve command: CLI takes precedence over config
+    final_command = resolve_command(producer_cmd, config_command, "producer")
+    logger.debug(f"Stream path: {resolved_stream_path}")
     logger.info(f"Opening stream for writing: {resolved_stream_path}")
 
     try:
@@ -484,13 +524,11 @@ def write(
         with zsfile.open(mode="wb", **kwargs) as writer:
             logger.info("Stream connected successfully")
 
-            if producer_cmd:
+            if final_command:
                 # Stream from subprocess
-                logger.debug(f"Using producer command: {producer_cmd}")
-                stream_subprocess_to_writer(writer, producer_cmd)
+                stream_subprocess_to_writer(writer, final_command)
             else:
                 # Stream from stdin
-                logger.debug("Reading from stdin")
                 stream_stdin_to_writer(writer)
 
             # Implicit flush on context exit
@@ -595,13 +633,15 @@ def read(
         consumer_cmd = []
 
     # Prepare SDK kwargs using global options (resolves stream_path from config if needed)
-    resolved_stream_path, kwargs = prepare_stream_kwargs(
+    resolved_stream_path, kwargs, config_command = prepare_stream_kwargs(
         StreamArgs(stream_path, connect_url, connect_timeout, access_token, passphrase),
         global_opts,
         StreamMode.READ,
     )
-
-    logger.debug(f"Stream path: {resolved_stream_path}, Consumer command: {consumer_cmd}")
+    
+    # Resolve command: CLI takes precedence over config
+    final_command = resolve_command(consumer_cmd, config_command, "consumer")
+    logger.debug(f"Stream path: {resolved_stream_path}")
     logger.info(f"Opening stream for reading: {resolved_stream_path}")
 
     try:
@@ -609,13 +649,11 @@ def read(
         with zsfile.open(mode="rb", **kwargs) as reader:
             logger.info("Stream connected successfully")
 
-            if consumer_cmd:
+            if final_command:
                 # Pipe stream data into subprocess stdin
-                logger.debug(f"Using consumer command: {consumer_cmd}")
-                stream_reader_to_subprocess(reader, consumer_cmd)
+                stream_reader_to_subprocess(reader, final_command)
             else:
                 # Write stream data to stdout
-                logger.debug("Writing to stdout")
                 stdout_binary = sys.stdout.buffer
                 while chunk := reader.read(CHUNK_SIZE):
                     try:

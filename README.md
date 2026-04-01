@@ -158,6 +158,8 @@ ZEBRASTREAM_ACCESS_TOKEN='your_token_here' zebrastream write -s /my-stream < fil
 
 Config files must include a `mode` field (`read` or `write`) that matches the subcommand used — this prevents accidentally using a write config with `read` or vice versa. If `stream_path` is included, the `-s/--stream-path` CLI option can be omitted.
 
+You can also specify a `command` in the config to define the producer (for write mode) or consumer (for read mode) command. This makes it easy to reuse complex pipeline configurations. Commands provided via CLI (`--` syntax) take precedence over config commands.
+
 ```yaml
 # ~/.config/zebrastream/streams/my-feed.yaml
 # Use with: zebrastream --config-name my-feed read
@@ -170,6 +172,12 @@ stream_path: /userspace/project/my-stream
 
 # Access token — prefer ZEBRASTREAM_ACCESS_TOKEN env var to keep it out of the file
 access_token: YOUR_ACCESS_TOKEN
+
+# Producer/consumer command (optional)
+# For write mode: producer command that generates data
+# For read mode: consumer command that processes data
+# Omit to use stdin (write) or stdout (read) instead
+# command: tar -xz -C /output
 
 # Passphrase for symmetric end-to-end encryption (optional)
 # Both sender and receiver must use the same passphrase
@@ -184,6 +192,37 @@ access_token: YOUR_ACCESS_TOKEN
 
 # Connection timeout in seconds (optional, default: no timeout)
 # connect_timeout: 30
+```
+
+**Command Configuration Examples:**
+
+```yaml
+# Producer config - backup database to stream
+# ~/.config/zebrastream/streams/db-backup.yaml
+mode: write
+stream_path: /backups/postgres/production
+command: pg_dump mydb
+```
+
+```yaml
+# Consumer config - extract tarball from stream
+# ~/.config/zebrastream/streams/deploy.yaml
+mode: read
+stream_path: /releases/app/latest
+command: tar -xz -C /var/www/app
+```
+
+Usage with command in config:
+
+```bash
+# Uses pg_dump command from config
+zebrastream --config-name db-backup write
+
+# Override config command with CLI
+zebrastream --config-name db-backup write -- pg_dumpall
+
+# Omit command to use stdin instead
+cat local-file.txt | zebrastream --config-name db-backup write
 ```
 
 For more details on configuration, authentication, and advanced options:

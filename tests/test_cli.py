@@ -216,7 +216,7 @@ def test_config_with_mode():
         global_opts = cli.GlobalOptions(config_name=None, config_file=temp_file, log_level="error")
 
         # Matching mode should succeed
-        path, kwargs = cli.prepare_stream_kwargs(cli.StreamArgs(), global_opts, cli.StreamMode.READ)
+        path, kwargs, _ = cli.prepare_stream_kwargs(cli.StreamArgs(), global_opts, cli.StreamMode.READ)
         assert path == "/my-stream"
 
         # Mismatched mode should exit with usage error
@@ -262,13 +262,13 @@ def test_prepare_stream_kwargs_from_config():
         )
         
         # Call without stream_path - should get it from config
-        resolved_path, kwargs = cli.prepare_stream_kwargs(cli.StreamArgs(), global_opts, cli.StreamMode.READ)
+        resolved_path, kwargs, _ = cli.prepare_stream_kwargs(cli.StreamArgs(), global_opts, cli.StreamMode.READ)
         assert resolved_path == "/config-stream"
         assert kwargs["stream_path"] == "/config-stream"
         assert kwargs["access_token"] == "test_token"
         
         # Call with stream_path - should override config
-        resolved_path, kwargs = cli.prepare_stream_kwargs(cli.StreamArgs(stream_path="/cli-stream"), global_opts, cli.StreamMode.READ)
+        resolved_path, kwargs, _ = cli.prepare_stream_kwargs(cli.StreamArgs(stream_path="/cli-stream"), global_opts, cli.StreamMode.READ)
         assert resolved_path == "/cli-stream"
         assert kwargs["stream_path"] == "/cli-stream"
     finally:
@@ -297,18 +297,18 @@ def test_passphrase_encryption_support():
         )
         
         # Should use passphrase parameter (works for both read and write)
-        resolved_path, kwargs = cli.prepare_stream_kwargs(cli.StreamArgs(), global_opts, cli.StreamMode.READ)
+        resolved_path, kwargs, _ = cli.prepare_stream_kwargs(cli.StreamArgs(), global_opts, cli.StreamMode.READ)
         assert kwargs["passphrase"] == "config_passphrase"
         
         # Test 2: Passphrase from CLI argument
-        resolved_path, kwargs = cli.prepare_stream_kwargs(
+        resolved_path, kwargs, _ = cli.prepare_stream_kwargs(
             cli.StreamArgs(passphrase="cli_passphrase"), global_opts, cli.StreamMode.READ
         )
         assert kwargs["passphrase"] == "cli_passphrase"
         
         # Test 3: Passphrase from environment variable
         with patch.dict("os.environ", {"ZEBRASTREAM_PASSPHRASE": "env_passphrase"}):
-            resolved_path, kwargs = cli.prepare_stream_kwargs(cli.StreamArgs(), global_opts, cli.StreamMode.READ)
+            resolved_path, kwargs, _ = cli.prepare_stream_kwargs(cli.StreamArgs(), global_opts, cli.StreamMode.READ)
             assert kwargs["passphrase"] == "env_passphrase"
     finally:
         Path(temp_file).unlink(missing_ok=True)
@@ -328,7 +328,7 @@ def test_passphrase_encryption_support():
         )
         
         with patch.dict("os.environ", {}, clear=True):
-            resolved_path, kwargs = cli.prepare_stream_kwargs(cli.StreamArgs(), global_opts, cli.StreamMode.READ)
+            resolved_path, kwargs, _ = cli.prepare_stream_kwargs(cli.StreamArgs(), global_opts, cli.StreamMode.READ)
             assert "passphrase" not in kwargs
     finally:
         Path(temp_file).unlink(missing_ok=True)
@@ -465,5 +465,123 @@ def test_write_producer_command_without_explicit_subcommand():
             assert exc_info.value.code == cli.EXIT_USAGE_ERROR
         finally:
             sys.argv = original_argv
+    finally:
+        Path(temp_file).unlink(missing_ok=True)
+
+
+def test_command_in_config():
+    """Test that command can be specified in config and CLI command takes precedence."""
+    from zebrastream.io import cli
+    import tempfile
+    from pathlib import Path
+
+    # Test 1: Config with producer command for write mode
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+        f.write("mode: write\n")
+        f.write("stream_path: /test-stream\n")
+        f.write("access_token: test_token\n")
+        f.write("command: pg_dump mydb\n")
+        temp_file = f.name
+
+    try:
+        global_opts = cli.GlobalOptions(
+            config_name=None,
+            config_file=temp_file,
+            log_level="error",
+        )
+
+        # Config command should be parsed from string
+        resolved_path, kwargs, config_command = cli.prepare_stream_kwargs(
+            cli.StreamArgs(), global_opts, cli.StreamMode.WRITE
+        )
+        assert config_command == ["pg_dump", "mydb"]
+
+        # resolve_command should use config command when no CLI command provided
+        final_command = cli.resolve_command([], config_command, "producer")
+        assert final_command == ["pg_dump", "mydb"]
+
+        # CLI command should take precedence over config command
+        cli_command = ["gzip"]
+        final_command = cli.resolve_command(cli_command, config_command, "producer")
+        assert final_command == ["gzip"]
+
+    finally:
+        Path(temp_file).unlink(missing_ok=True)
+
+    # Test 2: Config with consumer command for read mode
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+        f.write("mode: read\n")
+        f.write("stream_path: /test-stream\n")
+        f.write("access_token: test_token\n")
+        f.write("command: tar -xz -C /output\n")
+        temp_file = f.name
+
+    try:
+        global_opts = cli.GlobalOptions(
+            config_name=None,
+            config_file=temp_file,
+            log_level="error",
+        )
+
+        # Config command should be parsed with shell quoting
+        resolved_path, kwargs, config_command = cli.prepare_stream_kwargs(
+            cli.StreamArgs(), global_opts, cli.StreamMode.READ
+        )
+        assert config_command == ["tar", "-xz", "-C", "/output"]
+
+        # resolve_command should use config command when no CLI command provided
+        final_command = cli.resolve_command([], config_command, "consumer")
+        assert final_command == ["tar", "-xz", "-C", "/output"]
+
+    finally:
+        Path(temp_file).unlink(missing_ok=True)
+
+    # Test 3: Config without command should return None
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+        f.write("mode: read\n")
+        f.write("stream_path: /test-stream\n")
+        f.write("access_token: test_token\n")
+        temp_file = f.name
+
+    try:
+        global_opts = cli.GlobalOptions(
+            config_name=None,
+            config_file=temp_file,
+            log_level="error",
+        )
+
+        resolved_path, kwargs, config_command = cli.prepare_stream_kwargs(
+            cli.StreamArgs(), global_opts, cli.StreamMode.READ
+        )
+        assert config_command is None
+
+        # resolve_command should return empty list for stdin/stdout mode
+        final_command = cli.resolve_command([], config_command, "consumer")
+        assert final_command == []
+
+    finally:
+        Path(temp_file).unlink(missing_ok=True)
+
+    # Test 4: Invalid command type should exit with usage error
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+        f.write("mode: read\n")
+        f.write("stream_path: /test-stream\n")
+        f.write("access_token: test_token\n")
+        f.write("command: 123\n")  # Invalid: should be string
+        temp_file = f.name
+
+    try:
+        global_opts = cli.GlobalOptions(
+            config_name=None,
+            config_file=temp_file,
+            log_level="error",
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.prepare_stream_kwargs(
+                cli.StreamArgs(), global_opts, cli.StreamMode.READ
+            )
+        assert exc_info.value.code == cli.EXIT_USAGE_ERROR
+
     finally:
         Path(temp_file).unlink(missing_ok=True)
