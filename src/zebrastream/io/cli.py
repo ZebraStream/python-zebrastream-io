@@ -456,6 +456,7 @@ def write(
 
     Reads from stdin by default, or from a producer command if specified after '--'.
 
+    \b
     Examples:
         zebrastream write -s /my-stream < data.txt
         zebrastream write -s /my-stream -- pg_dump mydb
@@ -581,6 +582,7 @@ def read(
 
     Writes to stdout by default, or pipes into a consumer command if specified after '--'.
 
+    \b
     Examples:
         zebrastream read -s /my-stream > output.txt
         zebrastream read --stream-path /my-stream | tar -xz
