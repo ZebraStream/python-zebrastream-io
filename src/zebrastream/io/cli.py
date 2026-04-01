@@ -77,22 +77,22 @@ StreamPathOption = Annotated[
 
 ConnectUrlOption = Annotated[
     Optional[str],
-    typer.Option("--connect-url", help="Override connect API URL"),
+    typer.Option("-u", "--connect-url", help="Override connect API URL"),
 ]
 
 ConnectTimeoutOption = Annotated[
     Optional[int],
-    typer.Option("--connect-timeout", help="Connect timeout in seconds"),
+    typer.Option("-t", "--connect-timeout", help="Connect timeout in seconds"),
 ]
 
 AccessTokenOption = Annotated[
     Optional[str],
-    typer.Option("--access-token", help="Access token for authentication"),
+    typer.Option("-a", "--access-token", help="Access token for authentication"),
 ]
 
 PassphraseOption = Annotated[
     Optional[str],
-    typer.Option("--passphrase", help="Passphrase for symmetric encryption"),
+    typer.Option("-p", "--passphrase", help="Passphrase for symmetric encryption"),
 ]
 
 
@@ -250,15 +250,15 @@ def global_options(
     ctx: typer.Context,
     config_name: Annotated[
         Optional[str],
-        typer.Option("--config-name", help="Named configuration from ~/.config/zebrastream/streams/NAME.yaml"),
+        typer.Option("-n", "--config-name", help="Named configuration from ~/.config/zebrastream/streams/NAME.yaml"),
     ] = None,
     config_file: Annotated[
         Optional[str],
-        typer.Option("--config-file", help="Explicit path to a config file (takes precedence over --config-name)"),
+        typer.Option("-f", "--config-file", help="Explicit path to a config file (takes precedence over --config-name)"),
     ] = None,
     log_level: Annotated[
         Optional[str],
-        typer.Option("--log-level", help="Log level: error, warn, info, debug"),
+        typer.Option("-l", "--log-level", help="Log level: error, warn, info, debug"),
     ] = None,
 ) -> None:
     """Global options for all zebrastream commands."""
@@ -483,7 +483,7 @@ def write(
     passphrase: PassphraseOption = None,
     content_type: Annotated[
         Optional[str],
-        typer.Option("--content-type", help="Content-Type HTTP header for the stream"),
+        typer.Option("-c", "--content-type", help="Content-Type HTTP header for the stream"),
     ] = None,
     producer_cmd: Annotated[
         Optional[list[str]],
