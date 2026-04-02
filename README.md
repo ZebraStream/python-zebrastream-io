@@ -35,6 +35,22 @@ with zsfile.open(mode="w", stream_path="/my-stream", access_token=token) as f:
     f.write("This is ZebraStream")
 ```
 
+#### Real-time log streaming
+
+For real-time applications like log streaming, use `auto_flush_delay` to automatically flush buffered data after a specified time:
+
+```python
+import zebrastream.io.file as zsfile
+
+# Auto-flush every 5 seconds - no manual flush() needed
+with zsfile.open(mode="w", stream_path="/logs", access_token=token, auto_flush_delay=5) as f:
+    for log_line in generate_logs():
+        f.write(log_line + "\n")
+        # Data is automatically flushed within 5 seconds
+```
+
+This ensures low-latency delivery without requiring explicit flush calls after each write.
+
 #### Consumer
 
 ```python
@@ -132,9 +148,15 @@ echo "Hello ZebraStream" | zebrastream write -s /my-stream
 zebrastream write -s /my-stream -- pg_dump mydb
 zebrastream write --stream-path /my-stream -- sh -c "cat data.txt | gzip"
 
+# Real-time log streaming with auto-flush
+zebrastream write -s /my-stream --auto-flush-delay 5 -- tail -f /var/log/app.log
+
 # Read to stdout
 zebrastream read -s /my-stream > output.txt
 zebrastream read --stream-path /my-stream | tar -xz
+
+# Real-time log streaming with unbuffered output
+zebrastream read -s /logs -u | grep ERROR
 
 # Pipe into a consumer command
 zebrastream read -s /my-stream -- tar -xz
@@ -186,6 +208,16 @@ access_token: YOUR_ACCESS_TOKEN
 
 # Content-Type header (optional, write mode only)
 # content_type: application/octet-stream
+
+# Automatic flush delay in seconds (optional, write mode only)
+# Ensures buffered data is flushed at most N seconds after first write
+# Useful for real-time log streaming (minimum: 1 second)
+# auto_flush_delay: 5
+
+# Unbuffered output (optional, read mode only, default: false)
+# When true, disables output buffering for real-time streaming
+# Useful for log tailing and interactive output
+# unbuffered_output: true
 
 # Override connect API URL (optional, defaults to ZebraStream cloud)
 # connect_url: https://connect.zebrastream.io/v0/

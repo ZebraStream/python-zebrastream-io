@@ -439,6 +439,8 @@ def open(
             - connect_timeout (int): Connection timeout in seconds
             - write_buffer_size (int): Optional write buffer size in bytes (default: 64 KiB). Only for write modes.
             - transfer_buffer_multiplier (int): Transfer buffer size multiplier (default: 10). Only for write modes.
+            - auto_flush_delay (int): Automatic flush delay in seconds (default: None, disabled). Only for write modes.
+              When enabled, buffered data is flushed at most N seconds after first write. Minimum: 1 second.
             - connect_api_url (str): ZebraStream Connect API URL
               (defaults to public cloud service)
 
@@ -455,6 +457,12 @@ def open(
             with open(mode='r', stream_path='/logs') as f:
                 for line in f:
                     print(line)
+
+        Real-time log streaming with auto-flush::
+
+            with open(mode='w', stream_path='/logs', auto_flush_delay=5) as f:
+                for log_line in generate_logs():
+                    f.write(log_line)  # Auto-flushed within 5 seconds
 
         Binary write with immediate flush:
 
@@ -522,7 +530,24 @@ class Writer(io.BufferedIOBase):
     """
     Synchronous writer for ZebraStream data streams.
 
-    Note: Data may be buffered internally. Use flush() for immediate transmission.
+    Provides a file-like interface for writing to ZebraStream endpoints. Data may be
+    buffered internally for efficiency. Use flush() for immediate transmission, or
+    configure auto_flush_delay for time-based automatic flushing.
+
+    Examples:
+        Basic usage with manual flush::
+
+            writer = Writer(stream_path='/data', access_token='token')
+            writer.write(b'data')
+            writer.flush()  # Send immediately
+            writer.close()
+
+        Real-time log streaming with auto-flush::
+
+            writer = Writer(stream_path='/logs', access_token='token', auto_flush_delay=5)
+            for log_line in logs:
+                writer.write(log_line.encode())  # Auto-flushed within 5 seconds
+            writer.close()
     """
 
     # Instance-level type annotation

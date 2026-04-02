@@ -262,17 +262,24 @@ class AsyncWriter:
         Data written via write() may be buffered internally for efficiency. This buffering can occur at multiple
         levels (text wrapper, internal queues, HTTP layer) and helps optimize network performance for bulk transfers.
 
-        For applications requiring immediate data transmission (e.g., real-time logging, streaming), call flush()
-        after write() to ensure data is sent immediately without waiting for internal buffers to fill.
+        For applications requiring immediate data transmission (e.g., real-time logging, streaming), use one of:
+        - auto_flush_delay parameter for time-based automatic flushing
+        - Explicit flush() calls after write() for manual control
+        - write_buffer_size=0 for per-write flushing (highest overhead)
 
     Examples:
-        # Real-time streaming - immediate transmission:
-        async with AsyncWriter(stream, access_token="my_token", mode="wt") as writer:
+        # Real-time log streaming with auto-flush (recommended):
+        async with AsyncWriter(stream_path="/logs", access_token="token", auto_flush_delay=5) as writer:
+            for log_line in log_stream:
+                await writer.write(log_line)  # Auto-flushed within 5 seconds
+
+        # Manual flush for immediate transmission:
+        async with AsyncWriter(stream_path="/alerts", access_token="token") as writer:
             await writer.write("URGENT: system error\\n")
             await writer.flush()  # Guarantees immediate sending
 
         # Bulk transfer - let buffering optimize performance:
-        async with AsyncWriter(stream, access_token="my_token", mode="wb") as writer:
+        async with AsyncWriter(stream_path="/data", access_token="token") as writer:
             for data in large_dataset:
                 await writer.write(data)  # Buffered for efficiency
             # Implicit flush() on context exit
@@ -289,11 +296,13 @@ class AsyncWriter:
     _transfer_buffer: AsyncByteBuffer
     _write_failed: bool
     _upload_task: asyncio.Task[None] | None
+    _auto_flush_task: asyncio.Task[None] | None
     _data_stream_url: str | None
     is_started: bool
     _closed: bool
     _eof_sent: bool
     _passphrase: str | None
+    _auto_flush_delay: int | None
 
     @property
     def stream_path(self) -> str:
@@ -310,6 +319,7 @@ class AsyncWriter:
         passphrase: str | None = None,
         write_buffer_size: int = 65536,
         transfer_buffer_multiplier: int = 10,
+        auto_flush_delay: int | None = None,
     ) -> None:
         """
         Initialize an asynchronous ZebraStream writer.
@@ -334,6 +344,11 @@ class AsyncWriter:
                 Controls backpressure and memory usage. When buffer is full, write operations will block.
                 Must be >= 1. Default is 10 (640 KiB transfer buffer for 64 KiB write buffer).
                 Total memory: ~write_buffer_size × (1 + transfer_buffer_multiplier).
+            auto_flush_delay (int, optional): Automatic flush delay in seconds.
+                When set, buffered data is flushed at most N seconds after the first write
+                following a flush. Minimum value is 1 second. Set to None (default) to disable
+                time-based flushing. For immediate per-write flushing, use write_buffer_size=0
+                instead of auto_flush_delay=0.
         """
         self._stream_path = stream_path
         self._access_token = access_token
@@ -343,7 +358,13 @@ class AsyncWriter:
         self._passphrase = passphrase
         if transfer_buffer_multiplier < 1:
             raise ValueError(f"transfer_buffer_multiplier must be >= 1, got {transfer_buffer_multiplier}")
+        if auto_flush_delay is not None and auto_flush_delay < 1:
+            raise ValueError(
+                f"auto_flush_delay must be >= 1 (seconds) or None to disable, got {auto_flush_delay}. "
+                "For immediate flushing, use write_buffer_size=0 or explicit flush() calls."
+            )
         self.write_buffer_size = write_buffer_size
+        self._auto_flush_delay = auto_flush_delay
         self._write_buffer = bytearray()
         self._transfer_buffer = AsyncByteBuffer(write_buffer_size * transfer_buffer_multiplier)
         self._write_failed = False
@@ -354,6 +375,7 @@ class AsyncWriter:
         # Initialize attributes that are set later in start()
         self._upload_task: asyncio.Task[None] | None = None
         self._data_stream_url: str | None = None
+        self._auto_flush_task: asyncio.Task[None] | None = None
 
     async def _start_connect(self) -> None:
         self._data_stream_url = await _connect(
@@ -413,6 +435,7 @@ class AsyncWriter:
 
         # Send EOF if not already sent
         if not self._eof_sent:
+            await self._cancel_auto_flush_timer()  # Cancel timer before flushing
             await self._flush()  # Flush any remaining buffered data
             self._transfer_buffer.close()  # Signal EOF to upload task
             self._eof_sent = True
@@ -454,6 +477,8 @@ class AsyncWriter:
 
         logger.debug("Aborting AsyncWriter (no EOF will be sent)")
 
+        await self._cancel_auto_flush_timer()  # Cancel timer before aborting
+
         if self._upload_task is not None:
             self._upload_task.cancel()
             try:
@@ -493,6 +518,7 @@ class AsyncWriter:
 
         # Handle EOF signal: flush buffer, send EOF, then mark flag
         if data is None:
+            await self._cancel_auto_flush_timer()  # Cancel timer before EOF
             await self._flush()
             self._transfer_buffer.close()
             self._eof_sent = True
@@ -500,6 +526,9 @@ class AsyncWriter:
 
         # Accumulate data in buffer
         self._write_buffer.extend(data)
+
+        # Start auto-flush timer on first write after flush (if enabled)
+        self._start_auto_flush_timer()
 
         # Auto-flush when buffer reaches threshold
         if len(self._write_buffer) >= self.write_buffer_size:
@@ -541,6 +570,7 @@ class AsyncWriter:
 
     async def _flush(self) -> None:
         """Internal: Move write buffer to transfer buffer."""
+        await self._cancel_auto_flush_timer()  # Cancel timer when flushing
         if not self._write_buffer:
             return
         try:
@@ -559,6 +589,34 @@ class AsyncWriter:
     async def _drain(self) -> None:
         """Internal: Wait for transfer buffer to be consumed by upload task."""
         await self._transfer_buffer.drain()
+
+    def _start_auto_flush_timer(self) -> None:
+        """Start auto-flush timer if enabled and not already running."""
+        if self._auto_flush_delay is None:
+            return  # Timer disabled
+        if self._auto_flush_task is not None:
+            return  # Timer already running
+        self._auto_flush_task = asyncio.create_task(self._auto_flush_timer_loop())
+
+    async def _cancel_auto_flush_timer(self) -> None:
+        """Cancel auto-flush timer if running."""
+        if self._auto_flush_task is None:
+            return  # No timer running
+        self._auto_flush_task.cancel()
+        try:
+            await self._auto_flush_task
+        except asyncio.CancelledError:
+            pass  # Expected when cancelling
+        self._auto_flush_task = None
+
+    async def _auto_flush_timer_loop(self) -> None:
+        """Timer loop that flushes buffer after delay."""
+        try:
+            await asyncio.sleep(self._auto_flush_delay)
+            await self._flush()
+        finally:
+            # Clear task reference when timer completes or is cancelled
+            self._auto_flush_task = None
 
     async def _upload(self) -> None:
         async def plaintext_chunks() -> typing.AsyncGenerator[bytes, None]:

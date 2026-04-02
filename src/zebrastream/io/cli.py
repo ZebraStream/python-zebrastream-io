@@ -77,7 +77,7 @@ StreamPathOption = Annotated[
 
 ConnectUrlOption = Annotated[
     Optional[str],
-    typer.Option("-u", "--connect-url", help="Override connect API URL"),
+    typer.Option("-U", "--connect-url", help="Override Connect API URL"),
 ]
 
 ConnectTimeoutOption = Annotated[
@@ -95,6 +95,11 @@ PassphraseOption = Annotated[
     typer.Option("-p", "--passphrase", help="Passphrase for symmetric encryption"),
 ]
 
+AutoFlushDelayOption = Annotated[
+    Optional[int],
+    typer.Option("-d", "--auto-flush-delay", help="Automatic flush delay in seconds (min: 1, write mode only)"),
+]
+
 
 @dataclass
 class StreamArgs:
@@ -106,6 +111,7 @@ class StreamArgs:
     access_token: Optional[str] = None
     passphrase: Optional[str] = None
     content_type: Optional[str] = None  # write-only
+    auto_flush_delay: Optional[int] = None  # write-only
 
 
 class StderrFormatter(logging.Formatter):
@@ -287,6 +293,7 @@ def prepare_stream_kwargs(
     args: StreamArgs,
     global_opts: GlobalOptions,
     mode: StreamMode,
+    config: Optional[dict] = None,
 ) -> tuple[str, dict, Optional[list[str]]]:
     """Prepare kwargs for SDK stream open call.
     
@@ -294,12 +301,14 @@ def prepare_stream_kwargs(
         args: Stream connection arguments from CLI
         global_opts: Global CLI options (config name/file, log level)
         mode: The subcommand being run (read or write)
+        config: Optional pre-loaded config dict (if None, will load internally)
         
     Returns:
         Tuple of (resolved_stream_path, kwargs_dict, command_from_config) for zsfile.open()
     """
-    # Load configuration (config_file takes precedence over config_name)
-    config = load_config(global_opts.config_name, global_opts.config_file)
+    # Load configuration if not provided (config_file takes precedence over config_name)
+    if config is None:
+        config = load_config(global_opts.config_name, global_opts.config_file)
     
     # If a config is in use, its mode must be present and match the subcommand.
     # This prevents accidentally using a write config with 'read' or vice versa.
@@ -362,6 +371,12 @@ def prepare_stream_kwargs(
     
     if value := (args.content_type or config.get("content_type")):
         kwargs["content_type"] = value
+    
+    # auto_flush_delay (write mode only, similar to content_type)
+    # auto_flush_delay=0 is invalid but would be falsy, so use explicit None check
+    delay = args.auto_flush_delay if args.auto_flush_delay is not None else config.get("auto_flush_delay")
+    if delay is not None:
+        kwargs["auto_flush_delay"] = delay
     
     # Extract command from config if present (string format only)
     config_command = None
@@ -485,6 +500,7 @@ def write(
         Optional[str],
         typer.Option("-c", "--content-type", help="Content-Type HTTP header for the stream"),
     ] = None,
+    auto_flush_delay: AutoFlushDelayOption = None,
     producer_cmd: Annotated[
         Optional[list[str]],
         typer.Argument(help="Producer command and arguments (use -- before command)"),
@@ -497,7 +513,7 @@ def write(
     \b
     Examples:
         zebrastream write -s /my-stream < data.txt
-        zebrastream write -s /my-stream -- pg_dump mydb
+        zebrastream write -s /my-stream --auto-flush-delay 5 -- tail -f app.log
         zebrastream write -- sh -c "cat file.txt | gzip"  # stream_path from config
         zebrastream --config-name myconfig write  # if config has stream_path
     """
@@ -509,7 +525,7 @@ def write(
     
     # Prepare SDK kwargs using global options (resolves stream_path from config if needed)
     resolved_stream_path, kwargs, config_command = prepare_stream_kwargs(
-        StreamArgs(stream_path, connect_url, connect_timeout, access_token, passphrase, content_type),
+        StreamArgs(stream_path, connect_url, connect_timeout, access_token, passphrase, content_type, auto_flush_delay),
         global_opts,
         StreamMode.WRITE,
     )
@@ -611,6 +627,14 @@ def read(
     connect_timeout: ConnectTimeoutOption = None,
     access_token: AccessTokenOption = None,
     passphrase: PassphraseOption = None,
+    unbuffered_output: Annotated[
+        bool,
+        typer.Option(
+            "-u",
+            "--unbuffered-output",
+            help="Disable output buffering for real-time streaming (flushes immediately)",
+        ),
+    ] = False,
     consumer_cmd: Annotated[
         Optional[list[str]],
         typer.Argument(help="Consumer command and arguments (use -- before command)"),
@@ -622,9 +646,9 @@ def read(
 
     \b
     Examples:
-        zebrastream read -s /my-stream > output.txt
-        zebrastream read --stream-path /my-stream | tar -xz
-        zebrastream read -s /my-stream -- tar -xz
+        zebrastream read --stream-path /my-stream > output.txt
+        zebrastream read --stream-path /my-stream --unbuffered-output | grep ERROR
+        zebrastream read --stream-path /my-stream -- tar -xz
         zebrastream --config-name myconfig read -- python process.py
     """
     global_opts: GlobalOptions = ctx.obj
@@ -632,11 +656,20 @@ def read(
     if consumer_cmd is None:
         consumer_cmd = []
 
+    # Load config once at the beginning
+    config = load_config(global_opts.config_name, global_opts.config_file)
+    
+    # Resolve unbuffered_output: CLI flag takes precedence over config
+    # CLI flag is False by default, so we check config only if flag wasn't explicitly used
+    if not unbuffered_output and config.get("unbuffered_output"):
+        unbuffered_output = True
+
     # Prepare SDK kwargs using global options (resolves stream_path from config if needed)
     resolved_stream_path, kwargs, config_command = prepare_stream_kwargs(
         StreamArgs(stream_path, connect_url, connect_timeout, access_token, passphrase),
         global_opts,
         StreamMode.READ,
+        config,  # Pass the config we already loaded
     )
     
     # Resolve command: CLI takes precedence over config
@@ -653,8 +686,18 @@ def read(
                 # Pipe stream data into subprocess stdin
                 stream_reader_to_subprocess(reader, final_command)
             else:
-                # Write stream data to stdout
-                stdout_binary = sys.stdout.buffer
+                # Configure stdout for unbuffered output if requested (real-time streaming)
+                # Create the appropriate binary stream object once
+                if unbuffered_output:
+                    # Unbuffered binary stream (buffering=0) - flushes immediately after each write
+                    # closefd=False prevents closing the underlying file descriptor
+                    stdout_binary = open(sys.stdout.fileno(), mode='wb', buffering=0, closefd=False)
+                    logger.debug("Using unbuffered stdout for real-time output")
+                else:
+                    # Default: use buffered binary stream (sys.stdout.buffer)
+                    stdout_binary = sys.stdout.buffer
+                
+                # Stream data to stdout
                 while chunk := reader.read(CHUNK_SIZE):
                     try:
                         stdout_binary.write(chunk)
