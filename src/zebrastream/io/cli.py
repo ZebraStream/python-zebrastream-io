@@ -97,7 +97,7 @@ PassphraseOption = Annotated[
 
 AutoFlushDelayOption = Annotated[
     Optional[int],
-    typer.Option("-d", "--auto-flush-delay", help="Automatic flush delay in seconds (min: 1, write mode only)"),
+    typer.Option("-d", "--auto-flush-delay", help="Automatic flush delay in seconds (0=instant, 1+=timer, omit to disable)"),
 ]
 
 
@@ -526,7 +526,7 @@ def write(
     \b
     Examples:
         zebrastream write -s /my-stream < data.txt
-        zebrastream write -s /my-stream --unbuffered-input | tail -f app.log
+        zebrastream write -s /my-stream -d 0 -- tail -f app.log  # instant flush
         zebrastream write -s /my-stream --auto-flush-delay 5 -- tail -f app.log
         zebrastream write -- sh -c "cat file.txt | gzip"  # stream_path from config
         zebrastream --config-name myconfig write  # if config has stream_path

@@ -41,6 +41,10 @@ DEFAULT_ZEBRASTREAM_CONNECT_API_URL = "https://connect.zebrastream.io/v0/"
 # The original age format uses fixed 64 KiB chunks for optimal encryption performance
 AGE_CHUNK_SIZE = 64 * 1024  # 65536 bytes
 
+# Minimum transfer buffer size (prevents deadlock when write_buffer_size=0)
+# Set to AGE_CHUNK_SIZE to maintain efficient async operation
+MIN_TRANSFER_BUFFER_SIZE = AGE_CHUNK_SIZE  # 65536 bytes
+
 
 class _ErrorAction(Enum):
     """Actions to take when handling connection errors."""
@@ -263,20 +267,24 @@ class AsyncWriter:
         levels (text wrapper, internal queues, HTTP layer) and helps optimize network performance for bulk transfers.
 
         For applications requiring immediate data transmission (e.g., real-time logging, streaming), use one of:
-        - auto_flush_delay parameter for time-based automatic flushing
+        - auto_flush_delay=0 for instant flush on every write (lowest latency)
+        - auto_flush_delay=N for time-based automatic flushing (N seconds)
         - Explicit flush() calls after write() for manual control
-        - write_buffer_size=0 for per-write flushing (highest overhead)
 
     Examples:
-        # Real-time log streaming with auto-flush (recommended):
+        # Instant flush for low-latency (e.g., alerts, metrics):
+        async with AsyncWriter(stream_path="/alerts", access_token="token", auto_flush_delay=0) as writer:
+            await writer.write(b"CRITICAL: system down\\n")  # Flushed immediately
+
+        # Real-time log streaming with timer-based flush:
         async with AsyncWriter(stream_path="/logs", access_token="token", auto_flush_delay=5) as writer:
             for log_line in log_stream:
                 await writer.write(log_line)  # Auto-flushed within 5 seconds
 
-        # Manual flush for immediate transmission:
-        async with AsyncWriter(stream_path="/alerts", access_token="token") as writer:
-            await writer.write("URGENT: system error\\n")
-            await writer.flush()  # Guarantees immediate sending
+        # Manual flush for precise control:
+        async with AsyncWriter(stream_path="/events", access_token="token") as writer:
+            await writer.write(b"event data\\n")
+            await writer.flush()  # Explicit flush when needed
 
         # Bulk transfer - let buffering optimize performance:
         async with AsyncWriter(stream_path="/data", access_token="token") as writer:
@@ -344,11 +352,12 @@ class AsyncWriter:
                 Controls backpressure and memory usage. When buffer is full, write operations will block.
                 Must be >= 1. Default is 10 (640 KiB transfer buffer for 64 KiB write buffer).
                 Total memory: ~write_buffer_size × (1 + transfer_buffer_multiplier).
+                Note: A minimum transfer buffer size is enforced to ensure async operation works correctly.
             auto_flush_delay (int, optional): Automatic flush delay in seconds.
                 When set, buffered data is flushed at most N seconds after the first write
-                following a flush. Minimum value is 1 second. Set to None (default) to disable
-                time-based flushing. For immediate per-write flushing, use write_buffer_size=0
-                instead of auto_flush_delay=0.
+                following a flush. Set to 0 for instant flush on every write (disables write buffering).
+                Set to 1+ for timer-based flushing. Set to None (default) to disable time-based flushing.
+                Note: auto_flush_delay=0 is the most efficient instant-flush mechanism.
         """
         self._stream_path = stream_path
         self._access_token = access_token
@@ -358,15 +367,29 @@ class AsyncWriter:
         self._passphrase = passphrase
         if transfer_buffer_multiplier < 1:
             raise ValueError(f"transfer_buffer_multiplier must be >= 1, got {transfer_buffer_multiplier}")
-        if auto_flush_delay is not None and auto_flush_delay < 1:
+        if auto_flush_delay is not None and auto_flush_delay < 0:
             raise ValueError(
-                f"auto_flush_delay must be >= 1 (seconds) or None to disable, got {auto_flush_delay}. "
-                "For immediate flushing, use write_buffer_size=0 or explicit flush() calls."
+                f"auto_flush_delay must be >= 0 (seconds) or None to disable, got {auto_flush_delay}. "
+                "Use 0 for instant flush on every write, 1+ for timer-based flushing."
             )
-        self.write_buffer_size = write_buffer_size
-        self._auto_flush_delay = auto_flush_delay
+        
+        # Configure instant flush mode: auto_flush_delay=0 disables write buffering
+        # This leverages existing size-check logic without additional overhead
+        if auto_flush_delay == 0:
+            self.write_buffer_size = 0
+            self._auto_flush_delay = None  # No timer needed for instant flush
+        else:
+            self.write_buffer_size = write_buffer_size
+            self._auto_flush_delay = auto_flush_delay
+        
         self._write_buffer = bytearray()
-        self._transfer_buffer = AsyncByteBuffer(write_buffer_size * transfer_buffer_multiplier)
+        
+        # Ensure minimum transfer buffer size to prevent deadlock when write_buffer_size=0
+        transfer_size = max(
+            MIN_TRANSFER_BUFFER_SIZE,
+            self.write_buffer_size * transfer_buffer_multiplier
+        )
+        self._transfer_buffer = AsyncByteBuffer(transfer_size)
         self._write_failed = False
         self.is_started = False
         self._closed = False

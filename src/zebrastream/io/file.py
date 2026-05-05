@@ -440,7 +440,8 @@ def open(
             - write_buffer_size (int): Optional write buffer size in bytes (default: 64 KiB). Only for write modes.
             - transfer_buffer_multiplier (int): Transfer buffer size multiplier (default: 10). Only for write modes.
             - auto_flush_delay (int): Automatic flush delay in seconds (default: None, disabled). Only for write modes.
-              When enabled, buffered data is flushed at most N seconds after first write. Minimum: 1 second.
+              Set to 0 for instant flush on every write, 1+ for timer-based flushing. When enabled with a value >= 1,
+              buffered data is flushed at most N seconds after first write.
             - connect_api_url (str): ZebraStream Connect API URL
               (defaults to public cloud service)
 
@@ -458,13 +459,18 @@ def open(
                 for line in f:
                     print(line)
 
-        Real-time log streaming with auto-flush::
+        Real-time log streaming with timer-based auto-flush::
 
             with open(mode='w', stream_path='/logs', auto_flush_delay=5) as f:
                 for log_line in generate_logs():
                     f.write(log_line)  # Auto-flushed within 5 seconds
 
-        Binary write with immediate flush:
+        Instant flush for low-latency (alerts, metrics)::
+
+            with open(mode='w', stream_path='/alerts', auto_flush_delay=0) as f:
+                f.write('CRITICAL: system down\\n')  # Flushed immediately
+
+        Binary write with manual flush::
 
             with open(mode='wb', stream_path='/data') as f:
                 f.write(b'urgent data')
@@ -532,7 +538,7 @@ class Writer(io.BufferedIOBase):
 
     Provides a file-like interface for writing to ZebraStream endpoints. Data may be
     buffered internally for efficiency. Use flush() for immediate transmission, or
-    configure auto_flush_delay for time-based automatic flushing.
+    configure auto_flush_delay for automatic flushing (0=instant, 1+=timer-based).
 
     Examples:
         Basic usage with manual flush::
@@ -542,7 +548,12 @@ class Writer(io.BufferedIOBase):
             writer.flush()  # Send immediately
             writer.close()
 
-        Real-time log streaming with auto-flush::
+        Instant flush for low-latency::
+
+            writer = Writer(stream_path='/alerts', access_token='token', auto_flush_delay=0)
+            writer.write(b'CRITICAL\\n')  # Flushed immediately on every write
+
+        Real-time log streaming with timer-based auto-flush::
 
             writer = Writer(stream_path='/logs', access_token='token', auto_flush_delay=5)
             for log_line in logs:

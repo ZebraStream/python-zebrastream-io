@@ -37,19 +37,23 @@ with zsfile.open(mode="w", stream_path="/my-stream", access_token=token) as f:
 
 #### Real-time log streaming
 
-For real-time applications like log streaming, use `auto_flush_delay` to automatically flush buffered data after a specified time:
+For real-time applications like log streaming, use `auto_flush_delay` to automatically flush buffered data:
 
 ```python
 import zebrastream.io.file as zsfile
 
-# Auto-flush every 5 seconds - no manual flush() needed
+# Instant flush (0) - flushes immediately on every write (low-latency)
+with zsfile.open(mode="w", stream_path="/alerts", access_token=token, auto_flush_delay=0) as f:
+    f.write("CRITICAL: system down\n")  # Flushed immediately
+
+# Timer-based flush (5 seconds) - balances latency and efficiency
 with zsfile.open(mode="w", stream_path="/logs", access_token=token, auto_flush_delay=5) as f:
     for log_line in generate_logs():
         f.write(log_line + "\n")
         # Data is automatically flushed within 5 seconds
 ```
 
-This ensures low-latency delivery without requiring explicit flush calls after each write.
+Use `auto_flush_delay=0` for alerts and metrics where every millisecond counts. Use timer-based flushing (1+ seconds) for logs where you can tolerate a few seconds of delay.
 
 #### Consumer
 
@@ -148,7 +152,10 @@ echo "Hello ZebraStream" | zebrastream write -s /my-stream
 zebrastream write -s /my-stream -- pg_dump mydb
 zebrastream write --stream-path /my-stream -- sh -c "cat data.txt | gzip"
 
-# Real-time log streaming with auto-flush
+# Real-time log streaming with instant flush (low-latency)
+zebrastream write -s /alerts -d 0 -- tail -f /var/log/critical.log
+
+# Real-time log streaming with timer-based auto-flush (5 seconds)
 zebrastream write -s /my-stream --auto-flush-delay 5 -- tail -f /var/log/app.log
 
 # Read to stdout
@@ -210,8 +217,9 @@ access_token: YOUR_ACCESS_TOKEN
 # content_type: application/octet-stream
 
 # Automatic flush delay in seconds (optional, write mode only)
-# Ensures buffered data is flushed at most N seconds after first write
-# Useful for real-time log streaming (minimum: 1 second)
+# Set to 0 for instant flush on every write (low-latency)
+# Set to 1+ for timer-based flushing (balances latency and efficiency)
+# Omit or comment out to disable automatic flushing
 # auto_flush_delay: 5
 
 # Unbuffered output (optional, read mode only, default: false)
