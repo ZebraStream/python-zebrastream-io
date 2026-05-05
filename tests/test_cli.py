@@ -585,3 +585,226 @@ def test_command_in_config():
 
     finally:
         Path(temp_file).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Unbuffered input / output tests
+# ---------------------------------------------------------------------------
+
+def test_stream_stdin_to_writer_buffered():
+    """stream_stdin_to_writer uses sys.stdin.buffer by default."""
+    from zebrastream.io import cli
+
+    mock_writer = MagicMock()
+    mock_buffer = MagicMock()
+    mock_buffer.read.side_effect = [b"hello", b"world", b""]
+
+    with patch.object(sys, "stdin") as mock_stdin:
+        mock_stdin.buffer = mock_buffer
+        cli.stream_stdin_to_writer(mock_writer, unbuffered_input=False)
+
+    assert mock_writer.write.call_count == 2
+    mock_writer.write.assert_any_call(b"hello")
+    mock_writer.write.assert_any_call(b"world")
+
+
+def test_stream_stdin_to_writer_unbuffered():
+    """stream_stdin_to_writer opens a raw (buffering=0) fd when unbuffered_input=True."""
+    from zebrastream.io import cli
+
+    mock_writer = MagicMock()
+    mock_raw = MagicMock()
+    mock_raw.read.side_effect = [b"line1", b"line2", b""]
+
+    with patch("builtins.open", return_value=mock_raw) as mock_open:
+        with patch.object(sys.stdin, "fileno", return_value=0):
+            cli.stream_stdin_to_writer(mock_writer, unbuffered_input=True)
+
+    mock_open.assert_called_once_with(0, mode="rb", buffering=0, closefd=False)
+    assert mock_writer.write.call_count == 2
+
+
+def test_stream_stdin_to_writer_unbuffered_from_config():
+    """unbuffered_input: true in config file is honoured by the write subcommand."""
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    from zebrastream.io import cli
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write("mode: write\n")
+        f.write("stream_path: /test-stream\n")
+        f.write("access_token: test_token\n")
+        f.write("unbuffered_input: true\n")
+        temp_file = f.name
+
+    try:
+        with patch("zebrastream.io.cli.zsfile.open") as mock_zsfile_open:
+            mock_writer = MagicMock()
+            mock_zsfile_open.return_value.__enter__.return_value = mock_writer
+
+            mock_raw = MagicMock()
+            mock_raw.read.side_effect = [b"data", b""]
+
+            # Only intercept integer fd calls; pass string paths to the real open
+            # so that config file loading inside load_config() is not affected.
+            _real_open = open
+            def _selective_open(file, *args, **kwargs):
+                if isinstance(file, int):
+                    return mock_raw
+                return _real_open(file, *args, **kwargs)
+
+            original_argv = sys.argv
+            try:
+                sys.argv = ["zebrastream", "--config-file", temp_file, "write"]
+                with patch("builtins.open", side_effect=_selective_open) as mock_open:
+                    with patch.object(sys.stdin, "fileno", return_value=0):
+                        try:
+                            cli.main()
+                        except SystemExit as e:
+                            assert e.code == 0, f"Unexpected exit code {e.code}"
+            finally:
+                sys.argv = original_argv
+
+        # Verify open() was called with buffering=0 for the stdin fd
+        mock_open.assert_any_call(0, mode="rb", buffering=0, closefd=False)
+        mock_raw.read.assert_called()
+    finally:
+        Path(temp_file).unlink(missing_ok=True)
+
+
+def test_read_unbuffered_output_uses_raw_fd():
+    """--unbuffered-output opens stdout with buffering=0."""
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    from zebrastream.io import cli
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write("mode: read\n")
+        f.write("stream_path: /test-stream\n")
+        f.write("access_token: test_token\n")
+        temp_file = f.name
+
+    try:
+        with patch("zebrastream.io.cli.zsfile.open") as mock_zsfile_open:
+            mock_reader = MagicMock()
+            mock_reader.read.side_effect = [b"data", b""]
+            mock_zsfile_open.return_value.__enter__.return_value = mock_reader
+
+            mock_raw = MagicMock()
+
+            _real_open = open
+            def _selective_open(file, *args, **kwargs):
+                if isinstance(file, int):
+                    return mock_raw
+                return _real_open(file, *args, **kwargs)
+
+            original_argv = sys.argv
+            try:
+                sys.argv = [
+                    "zebrastream", "--config-file", temp_file,
+                    "read", "--unbuffered-output",
+                ]
+                with patch("builtins.open", side_effect=_selective_open) as mock_open:
+                    with patch.object(sys.stdout, "fileno", return_value=1):
+                        try:
+                            cli.main()
+                        except SystemExit as e:
+                            assert e.code == 0, f"Unexpected exit code {e.code}"
+            finally:
+                sys.argv = original_argv
+
+        mock_open.assert_any_call(1, mode="wb", buffering=0, closefd=False)
+        mock_raw.write.assert_called_once_with(b"data")
+    finally:
+        Path(temp_file).unlink(missing_ok=True)
+
+
+def test_read_buffered_output_uses_stdout_buffer():
+    """Without --unbuffered-output, read writes to sys.stdout.buffer."""
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    from zebrastream.io import cli
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write("mode: read\n")
+        f.write("stream_path: /test-stream\n")
+        f.write("access_token: test_token\n")
+        temp_file = f.name
+
+    try:
+        with patch("zebrastream.io.cli.zsfile.open") as mock_zsfile_open:
+            mock_reader = MagicMock()
+            mock_reader.read.side_effect = [b"chunk", b""]
+            mock_zsfile_open.return_value.__enter__.return_value = mock_reader
+
+            mock_buffer = MagicMock()
+            mock_stdout = MagicMock()
+            mock_stdout.buffer = mock_buffer
+
+            original_argv = sys.argv
+            try:
+                sys.argv = ["zebrastream", "--config-file", temp_file, "read"]
+                with patch("sys.stdout", mock_stdout):
+                    try:
+                        cli.main()
+                    except SystemExit as e:
+                        assert e.code == 0, f"Unexpected exit code {e.code}"
+            finally:
+                sys.argv = original_argv
+
+        mock_buffer.write.assert_called_once_with(b"chunk")
+    finally:
+        Path(temp_file).unlink(missing_ok=True)
+
+
+def test_read_unbuffered_output_from_config():
+    """unbuffered_output: true in config file enables unbuffered stdout."""
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    from zebrastream.io import cli
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write("mode: read\n")
+        f.write("stream_path: /test-stream\n")
+        f.write("access_token: test_token\n")
+        f.write("unbuffered_output: true\n")
+        temp_file = f.name
+
+    try:
+        with patch("zebrastream.io.cli.zsfile.open") as mock_zsfile_open:
+            mock_reader = MagicMock()
+            mock_reader.read.side_effect = [b"data", b""]
+            mock_zsfile_open.return_value.__enter__.return_value = mock_reader
+
+            mock_raw = MagicMock()
+
+            _real_open = open
+            def _selective_open(file, *args, **kwargs):
+                if isinstance(file, int):
+                    return mock_raw
+                return _real_open(file, *args, **kwargs)
+
+            original_argv = sys.argv
+            try:
+                sys.argv = ["zebrastream", "--config-file", temp_file, "read"]
+                with patch("builtins.open", side_effect=_selective_open) as mock_open:
+                    with patch.object(sys.stdout, "fileno", return_value=1):
+                        try:
+                            cli.main()
+                        except SystemExit as e:
+                            assert e.code == 0, f"Unexpected exit code {e.code}"
+            finally:
+                sys.argv = original_argv
+
+        mock_open.assert_any_call(1, mode="wb", buffering=0, closefd=False)
+        mock_raw.write.assert_called()
+    finally:
+        Path(temp_file).unlink(missing_ok=True)

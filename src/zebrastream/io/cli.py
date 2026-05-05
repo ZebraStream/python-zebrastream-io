@@ -418,13 +418,18 @@ def resolve_command(
         return []
 
 
-def stream_stdin_to_writer(writer) -> None:
+def stream_stdin_to_writer(writer, unbuffered_input: bool = False) -> None:
     """Stream data from stdin to the writer.
     
     Args:
         writer: ZebraStream writer object (binary mode)
+        unbuffered_input: If True, use unbuffered stdin for real-time streaming
     """
-    stdin_binary = sys.stdin.buffer
+    if unbuffered_input:
+        stdin_binary = open(sys.stdin.fileno(), mode='rb', buffering=0, closefd=False)
+        logger.debug("Using unbuffered stdin for real-time input")
+    else:
+        stdin_binary = sys.stdin.buffer
     
     try:
         while chunk := stdin_binary.read(CHUNK_SIZE):
@@ -501,6 +506,14 @@ def write(
         typer.Option("-c", "--content-type", help="Content-Type HTTP header for the stream"),
     ] = None,
     auto_flush_delay: AutoFlushDelayOption = None,
+    unbuffered_input: Annotated[
+        bool,
+        typer.Option(
+            "-u",
+            "--unbuffered-input",
+            help="Disable input buffering for real-time streaming (reads stdin immediately)",
+        ),
+    ] = False,
     producer_cmd: Annotated[
         Optional[list[str]],
         typer.Argument(help="Producer command and arguments (use -- before command)"),
@@ -513,6 +526,7 @@ def write(
     \b
     Examples:
         zebrastream write -s /my-stream < data.txt
+        zebrastream write -s /my-stream --unbuffered-input | tail -f app.log
         zebrastream write -s /my-stream --auto-flush-delay 5 -- tail -f app.log
         zebrastream write -- sh -c "cat file.txt | gzip"  # stream_path from config
         zebrastream --config-name myconfig write  # if config has stream_path
@@ -522,12 +536,21 @@ def write(
     # producer_cmd is None or empty list for stdin mode, populated list for producer mode
     if producer_cmd is None:
         producer_cmd = []
-    
+
+    # Load config once at the beginning
+    config = load_config(global_opts.config_name, global_opts.config_file)
+
+    # Resolve unbuffered_input: CLI flag takes precedence over config
+    # CLI flag is False by default, so we check config only if flag wasn't explicitly used
+    if not unbuffered_input and config.get("unbuffered_input"):
+        unbuffered_input = True
+
     # Prepare SDK kwargs using global options (resolves stream_path from config if needed)
     resolved_stream_path, kwargs, config_command = prepare_stream_kwargs(
         StreamArgs(stream_path, connect_url, connect_timeout, access_token, passphrase, content_type, auto_flush_delay),
         global_opts,
         StreamMode.WRITE,
+        config,  # Pass the config we already loaded
     )
     
     # Resolve command: CLI takes precedence over config
@@ -545,7 +568,7 @@ def write(
                 stream_subprocess_to_writer(writer, final_command)
             else:
                 # Stream from stdin
-                stream_stdin_to_writer(writer)
+                stream_stdin_to_writer(writer, unbuffered_input)
 
             # Implicit flush on context exit
             logger.info("Data transfer completed successfully")
